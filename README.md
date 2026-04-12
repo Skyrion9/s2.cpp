@@ -218,7 +218,13 @@ Updated native C# P/Invoke example: [`examples/csharp`](examples/csharp) contain
 
 Go CGo example: [`examples/golang`](examples/golang) mirrors the C# example with the same five flows (smoke, from-files, modular, legacy-stream, stream-ex) using runtime `dlopen` loading — no build-time dependency on `libs2`. Streaming callbacks use `//export` Go functions with `sync.Map` for session state, equivalent to the C# `GCHandle` pattern.
 
-Community C# wrapper: [FishS2Sharp](https://github.com/subspecs/FishS2Sharp) targets .NET Standard 2.1 and wraps the exported library API for C# / Unity-style integration.
+---
+
+## Community Made Wrappers/Ports:
+
+| Repo. Name | Language | Maintainer |
+|---|---|:---:|
+| [FishS2Sharp](https://github.com/subspecs/FishS2Sharp) | `C#` | <a href="https://github.com/subspecs" target="_blank"><center><img src="https://images.weserv.nl/?url=avatars.githubusercontent.com/u/45248469?v=4&h=35&w=35&fit=cover&mask=circle&maxage=7d" alt="SubSpecs"></center></a> |
 
 ---
 
