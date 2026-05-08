@@ -130,9 +130,10 @@ public:
 
     const ModelHParams & hparams() const { return hparams_; }
 
+    ModelWeights   weights_; //So they would be sharable.
+
 private:
     ModelHParams   hparams_;
-    ModelWeights   weights_;
     ggml_backend_t backend_cpu_  = nullptr;
     ggml_backend_t backend_gpu_  = nullptr;
     ggml_backend_sched_t sched_       = nullptr;

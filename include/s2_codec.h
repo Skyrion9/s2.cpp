@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "s2_model.h"
+
 namespace s2 {
 
 class AudioCodec {
@@ -20,7 +22,7 @@ public:
 
     bool load(const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU);
 
-    bool load_shared(gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU);
+    bool load_shared(SlowARModel* Model, gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU);
 
     bool read_tensor_data(const std::string & gguf_path, gguf_context * gguf_ctx);
 

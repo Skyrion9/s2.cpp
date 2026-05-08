@@ -646,7 +646,7 @@ const char * AudioCodec::backend_name() const {
     return ggml_backend_name(impl_->backend);
 }
 
-bool AudioCodec::load_shared(gguf_context * shared_gguf_ctx, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type) {
+bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type) {
     if (!impl_) {
         impl_ = new Impl();
     } else {
@@ -703,15 +703,20 @@ bool AudioCodec::load_shared(gguf_context * shared_gguf_ctx, const std::string &
         return false;
     }
 
-    struct gguf_init_params params = { true, &impl_->ctx_w };
-    gguf_context * local_gguf = gguf_init_from_file(gguf_path.c_str(), params);
-    if (!local_gguf) {
-        std::cerr << "[Codec] Failed to open " << gguf_path << std::endl;
-        reset_codec_impl(*impl_);
-        return false;
-    }
+    if(!Model)
+    {
+        //This WILL load the entire model weights AGAIN, x2'ing the VRAM req.
+        struct gguf_init_params params = { true, &impl_->ctx_w };
+        gguf_context * local_gguf = gguf_init_from_file(gguf_path.c_str(), params);
+        if (!local_gguf) {
+            std::cerr << "[Codec] Failed to open " << gguf_path << std::endl;
+            reset_codec_impl(*impl_);
+            return false;
+        }
 
-    gguf_free(local_gguf);
+        gguf_free(local_gguf);
+    }
+    else { impl_->ctx_w = Model->weights_.ctx_w; } //Share the model weights, save VRAM space!
 
     gguf_context * gguf_ctx = shared_gguf_ctx;
 
@@ -911,7 +916,7 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, Backend
         return false;
     }
 
-    if (!load_shared(ctx_gguf, gguf_path, gpu_device, backend_type)) {
+    if (!load_shared(nullptr, ctx_gguf, gguf_path, gpu_device, backend_type)) {
         gguf_free(ctx_gguf);
         return false;
     }

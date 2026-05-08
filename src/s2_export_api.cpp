@@ -493,6 +493,25 @@ int InitializeS2AudioCodec(s2::AudioCodec* AudioCodec, const char* gguf_path,
 
     return AudioCodec->load(std::string(gguf_path), gpu_device, to_backend_type(backend_type)) ? 1 : 0;
 }
+int InitializeS2AudioCodecModelShared(s2::SlowARModel* Model, s2::AudioCodec* AudioCodec, const char* gguf_path,
+    int32_t gpu_device, int32_t backend_type) {
+
+    if (!Model || !AudioCodec || !has_value(gguf_path)) {
+        return 0;
+    }
+
+    struct gguf_init_params params = { true, nullptr };
+    gguf_context * ctx_gguf = gguf_init_from_file(gguf_path, params);
+
+    int MRes = Model->load_shared(ctx_gguf, std::string(gguf_path), gpu_device, to_backend_type(backend_type)) ? 1 : 0;
+    MRes = Model->read_tensor_data(gguf_path, ctx_gguf); 
+
+    int CRes = AudioCodec->load_shared(Model, ctx_gguf, std::string(gguf_path), gpu_device, to_backend_type(backend_type)) ? 1 : 0;
+    CRes = AudioCodec->read_tensor_data(gguf_path, ctx_gguf); 
+
+    gguf_free(ctx_gguf);
+    return (CRes && MRes) ? 1 : 0;
+}
 
 std::vector<int32_t>* AllocS2AudioPromptCodes() {
     return new std::vector<int32_t>();

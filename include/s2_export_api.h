@@ -80,6 +80,8 @@ extern "C"
     S2_Export void ReleaseS2AudioCodec(s2::AudioCodec* AudioCodec);
     S2_Export int InitializeS2AudioCodec(s2::AudioCodec* AudioCodec, const char* gguf_path,
                                          int32_t gpu_device, int32_t backend_type);
+    S2_Export int InitializeS2AudioCodecModelShared(s2::SlowARModel* Model, s2::AudioCodec* AudioCodec, const char* gguf_path,
+        int32_t gpu_device, int32_t backend_type);
 
     S2_Export std::vector<int32_t>* AllocS2AudioPromptCodes();
     S2_Export void ReleaseS2AudioPromptCodes(std::vector<int32_t>* AudioPromptCodes);

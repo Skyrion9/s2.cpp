@@ -465,7 +465,7 @@ bool Pipeline::init(const PipelineParams & params) {
             safe_print_ln("Pipeline: loading codec on " + backend_label +
                           " device " + std::to_string(codec_gpu_device) + "...");
         }
-        codec_loaded = codec().load_shared(shared_gguf, params.model_path, codec_gpu_device, codec_backend_type);
+        codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, codec_gpu_device, codec_backend_type);
         if (!codec_loaded) {
             if (codec_backend_type == BackendType::Metal) {
                 safe_print_warn_ln(
@@ -483,7 +483,7 @@ bool Pipeline::init(const PipelineParams & params) {
         if (!use_gpu_codec) {
             safe_print_ln("Pipeline: loading codec on CPU.");
         }
-        codec_loaded = codec().load_shared(shared_gguf, params.model_path, -1, BackendType::CPU);
+        codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, -1, BackendType::CPU);
     }
     if (!codec_loaded) {
         safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
@@ -729,6 +729,7 @@ bool Pipeline::encode_prompt_audio(const std::string & audio_path, int32_t n_thr
         return false;
     }
 
+    safe_print_warn_ln("Encoding....");
     if (!codec().encode(ref_audio.samples.data(), static_cast<int32_t>(ref_audio.samples.size()),
                         n_threads, codes_out, n_frames_out)) {
         safe_print_warn_ln("Pipeline warning: encode failed, running without reference audio.");
@@ -736,6 +737,7 @@ bool Pipeline::encode_prompt_audio(const std::string & audio_path, int32_t n_thr
         n_frames_out = 0;
         return false;
     }
+    safe_print_warn_ln("Encoding.... done!");
 
     return true;
 }
