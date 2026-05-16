@@ -11,16 +11,6 @@
 
 ---
 
-## Contributors
-
-- [@felipeov1](https://github.com/felipeov1)
-- [@ivanodintsov](https://github.com/ivanodintsov)
-- [@kolulu23](https://github.com/kolulu23)
-- [@rodrigomatta](https://github.com/rodrigomatta)
-- [@subspecs](https://github.com/subspecs)
-
----
-
 ## What this is
 
 This repository contains:
@@ -592,3 +582,42 @@ Full license: [LICENSE.md](LICENSE.md)
 Commercial licensing: [https://fish.audio](https://fish.audio) · [business@fish.audio](mailto:business@fish.audio)
 
 The inference engine source code (`src/`) is a Derivative Work of the Fish Audio Materials as defined in the Agreement and is distributed under the same Fish Audio Research License terms.
+
+---
+
+## Contributors
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/felipeov1">
+        <img src="https://github.com/felipeov1.png?size=96" width="64" height="64" alt="@felipeov1"><br>
+        <sub><b>@felipeov1</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/ivanodintsov">
+        <img src="https://github.com/ivanodintsov.png?size=96" width="64" height="64" alt="@ivanodintsov"><br>
+        <sub><b>@ivanodintsov</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/kolulu23">
+        <img src="https://github.com/kolulu23.png?size=96" width="64" height="64" alt="@kolulu23"><br>
+        <sub><b>@kolulu23</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/rodrigomatta">
+        <img src="https://github.com/rodrigomatta.png?size=96" width="64" height="64" alt="@rodrigomatta"><br>
+        <sub><b>@rodrigomatta</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/subspecs">
+        <img src="https://github.com/subspecs.png?size=96" width="64" height="64" alt="@subspecs"><br>
+        <sub><b>@subspecs</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
