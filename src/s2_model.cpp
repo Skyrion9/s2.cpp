@@ -743,8 +743,9 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         return false;
     }
 
-    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
-    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
+    // Layout for flash attention
+    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, max_seq_len, n_head_kv, n_layer);
+    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, max_seq_len, n_head_kv, n_layer);
 
     ggml_backend_t kv_backend = (n_gpu_layers_ > 0 && backend_gpu_) ? backend_gpu_ : backend_cpu_;
     kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, kv_backend);
@@ -983,7 +984,6 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     }
 
     if (codebook_sum != nullptr) {
-
         codebook_sum = ggml_mul(ctx0, codebook_sum,
                                 ggml_repeat(ctx0, semantic_mask, codebook_sum));
         x = ggml_add(ctx0, x, codebook_sum);
@@ -1021,53 +1021,84 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
 
         const size_t layer_off_k = static_cast<size_t>(il) * memory_k_->nb[3];
         const size_t layer_off_v = static_cast<size_t>(il) * memory_v_->nb[3];
-        const size_t token_off_k = static_cast<size_t>(n_past_) * memory_k_->nb[2];
-        const size_t token_off_v = static_cast<size_t>(n_past_) * memory_v_->nb[2];
+        const size_t token_off_k = static_cast<size_t>(n_past_) * memory_k_->nb[1];
+        const size_t token_off_v = static_cast<size_t>(n_past_) * memory_v_->nb[1];
 
         ggml_tensor * k_slot = ggml_view_3d(ctx0, memory_k_,
-            head_dim, n_head_kv, n_tokens,
+            head_dim, n_tokens, n_head_kv,
             memory_k_->nb[1], memory_k_->nb[2],
             layer_off_k + token_off_k);
         ggml_tensor * v_slot = ggml_view_3d(ctx0, memory_v_,
-            head_dim, n_head_kv, n_tokens,
+            head_dim, n_tokens, n_head_kv,
             memory_v_->nb[1], memory_v_->nb[2],
             layer_off_v + token_off_v);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, k, k_slot));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, v, v_slot));
+            
+        // Permute k and v to match the cache layout
+        ggml_tensor * k_perm = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
+        ggml_tensor * v_perm = ggml_cont(ctx0, ggml_permute(ctx0, v, 0, 2, 1, 3));
 
-        ggml_tensor * k_mem = k;
-        ggml_tensor * v_mem = v;
-        if (n_past_ > 0) {
-            ggml_tensor * k_past = ggml_reshape_3d(ctx0,
-                ggml_view_1d(ctx0, memory_k_, static_cast<int64_t>(n_past_) * kv_size, layer_off_k),
-                head_dim, n_head_kv, n_past_);
-            ggml_tensor * v_past = ggml_reshape_3d(ctx0,
-                ggml_view_1d(ctx0, memory_v_, static_cast<int64_t>(n_past_) * kv_size, layer_off_v),
-                head_dim, n_head_kv, n_past_);
-            if (k_past->type != k->type) k_past = ggml_cast(ctx0, k_past, k->type);
-            if (v_past->type != v->type) v_past = ggml_cast(ctx0, v_past, v->type);
-            k_mem = ggml_concat(ctx0, k_past, k, 2);
-            v_mem = ggml_concat(ctx0, v_past, v, 2);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_perm, k_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_perm, v_slot));
+
+        ggml_tensor * attn_cur = nullptr;
+
+        if (n_tokens == 1) {
+            // Flash attention path
+            ggml_tensor * Q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+
+            ggml_tensor * k_cache = ggml_view_3d(ctx0, memory_k_,
+                head_dim, n_past_ + 1, n_head_kv,
+                memory_k_->nb[1], memory_k_->nb[2], layer_off_k);
+
+            ggml_tensor * v_cache = ggml_view_3d(ctx0, memory_v_,
+                head_dim, n_past_ + 1, n_head_kv,
+                memory_v_->nb[1], memory_v_->nb[2], layer_off_v);
+
+            ggml_tensor * attn_fa = ggml_flash_attn_ext(
+                ctx0, Q, k_cache, v_cache, nullptr, attn_scale, 0.0f, 0.0f);
+            
+            // attn_fa is [head_dim, n_head, n_tokens=1, 1]; with n_tokens==1 no reorder is needed.
+            attn_cur = ggml_cpy(ctx0, attn_fa,
+                 ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
+        } else {
+            // Prefill path (keep concat logic)
+            ggml_tensor * k_mem = k;
+            ggml_tensor * v_mem = v;
+            if (n_past_ > 0) {
+                ggml_tensor * k_past_view = ggml_view_3d(ctx0, memory_k_,
+                    head_dim, n_past_, n_head_kv,
+                    memory_k_->nb[1], memory_k_->nb[2], layer_off_k);
+                ggml_tensor * v_past_view = ggml_view_3d(ctx0, memory_v_,
+                    head_dim, n_past_, n_head_kv,
+                    memory_v_->nb[1], memory_v_->nb[2], layer_off_v);
+                
+                ggml_tensor * k_past = ggml_cont(ctx0, ggml_permute(ctx0, k_past_view, 0, 2, 1, 3));
+                ggml_tensor * v_past = ggml_cont(ctx0, ggml_permute(ctx0, v_past_view, 0, 2, 1, 3));
+
+                if (k_past->type != k->type) k_past = ggml_cast(ctx0, k_past, k->type);
+                if (v_past->type != v->type) v_past = ggml_cast(ctx0, v_past, v->type);
+                
+                k_mem = ggml_concat(ctx0, k_past, k, 2);
+                v_mem = ggml_concat(ctx0, v_past, v, 2);
+            }
+            if (n_head != n_head_kv && q->type != GGML_TYPE_F32) {
+                q = ggml_cast(ctx0, q, GGML_TYPE_F32);
+            }
+            ggml_tensor * k_rep = repeat_interleave_heads(ctx0, k_mem, n_head / n_head_kv);
+            ggml_tensor * v_rep = repeat_interleave_heads(ctx0, v_mem, n_head / n_head_kv);
+            ggml_tensor * Q   = ggml_permute(ctx0, q,     0, 2, 1, 3);
+            ggml_tensor * K   = ggml_permute(ctx0, k_rep, 0, 2, 1, 3);
+            ggml_tensor * KQ  = mul_mat_checked(ctx0, K, Q, "mul_mat:kq");
+            ggml_tensor * KQs = ggml_scale(ctx0, KQ, attn_scale);
+            ggml_tensor * KQm = ggml_diag_mask_inf(ctx0, KQs, n_past_);
+            ggml_tensor * KQf = ggml_soft_max(ctx0, KQm);
+            ggml_tensor * V       = ggml_cont(ctx0, ggml_permute(ctx0, v_rep, 1, 2, 0, 3));
+            ggml_tensor * KQV     = mul_mat_checked(ctx0, V, KQf, "mul_mat:kqv");
+            ggml_tensor * KQVm    = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+            attn_cur = ggml_cpy(ctx0, KQVm,
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
         }
 
-        if (n_head != n_head_kv && q->type != GGML_TYPE_F32) {
-            q = ggml_cast(ctx0, q, GGML_TYPE_F32);
-        }
-        ggml_tensor * k_rep = repeat_interleave_heads(ctx0, k_mem, n_head / n_head_kv);
-        ggml_tensor * v_rep = repeat_interleave_heads(ctx0, v_mem, n_head / n_head_kv);
-
-        ggml_tensor * Q   = ggml_permute(ctx0, q,     0, 2, 1, 3);
-        ggml_tensor * K   = ggml_permute(ctx0, k_rep, 0, 2, 1, 3);
-        ggml_tensor * KQ  = mul_mat_checked(ctx0, K, Q, "mul_mat:kq");
-        ggml_tensor * KQs = ggml_scale(ctx0, KQ, attn_scale);
-        ggml_tensor * KQm = ggml_diag_mask_inf(ctx0, KQs, n_past_);
-        ggml_tensor * KQf = ggml_soft_max(ctx0, KQm);
-
-        ggml_tensor * V       = ggml_cont(ctx0, ggml_permute(ctx0, v_rep, 1, 2, 0, 3));
-        ggml_tensor * KQV     = mul_mat_checked(ctx0, V, KQf, "mul_mat:kqv");
-        ggml_tensor * KQVm    = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-        ggml_tensor * attn_cur = ggml_cpy(ctx0, KQVm,
-                                          ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:wo");
 
         ggml_tensor * h     = ggml_add(ctx0, x, attn_out);
