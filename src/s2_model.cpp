@@ -478,23 +478,23 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
 
     weight_tensor_set_.insert(weight_tensors.begin(), weight_tensors.end());
 
-        const bool full_model_offload =
-            backend_gpu_ != nullptr &&
-            backend_type != BackendType::CUDA &&
-                        n_gpu_layers_ == hparams_.block_count;
+    const bool full_model_offload =
+        backend_gpu_ != nullptr &&
+        backend_type != BackendType::CUDA &&
+        n_gpu_layers_ == hparams_.block_count;
 
-        auto get_weight_backend = [&](const std::string & name) -> ggml_backend_t {
-            
-            if (full_model_offload) {
+    auto get_weight_backend = [&](const std::string & name) -> ggml_backend_t {
+
+        if (full_model_offload) {
             return backend_gpu_;
         }
 
-                if (name == "embeddings.weight" ||
-                    name == "codebook_embeddings.weight" ||
-                    name == "fast_embeddings.weight" ||
-                    name == "norm.weight") {
-                    return backend_cpu_;
-                            }
+        if (name == "embeddings.weight" ||
+            name == "codebook_embeddings.weight" ||
+            name == "fast_embeddings.weight" ||
+            name == "norm.weight") {
+            return backend_cpu_;
+        }
 
         if (name.rfind("fast_layers.", 0) == 0 ||
             name.rfind("fast_", 0) == 0) {
@@ -961,7 +961,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         x = ggml_mul(ctx0, x, ggml_repeat(ctx0, token_scale, x));
     }
 
-        for (int32_t il = 0; il < hparams_.block_count; ++il) {
+    for (int32_t il = 0; il < hparams_.block_count; ++il) {
         const auto & layer = weights_.layers[il];
 
         ggml_tensor * attn_in = rms_norm_weighted(ctx0, x, layer.attention_norm, hparams_.rms_norm_eps);
