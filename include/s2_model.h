@@ -138,6 +138,7 @@ private:
     ggml_backend_t backend_gpu_  = nullptr;
     ggml_backend_sched_t sched_       = nullptr;
     ggml_backend_sched_t fast_sched_  = nullptr;
+    ggml_gallocr_t fast_gallocr_ = nullptr;
     ggml_context * ctx_kv_      = nullptr;
     ggml_backend_buffer_t kv_buf_ = nullptr;
     ggml_tensor *  memory_k_   = nullptr;
