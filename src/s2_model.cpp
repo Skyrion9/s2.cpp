@@ -815,12 +815,21 @@ bool SlowARModel::prefill(const std::vector<int32_t> & flat_tokens, int32_t n_to
             backend_requires_single_token_semantic_prefill(backend_gpu_)) {
             chunk_tokens = 1;
         } else {
+            // Backend-specific prefill chunk sizes for naive attention path.
+            // Vulkan: Limited by ggml_soft_max shader workgroup/shared memory limits
+            // CUDA/Metal: Highly optimized soft_max kernels handle large batches
+            // CPU: Memory bandwidth bound, scale with available parallelism
+            int32_t adaptive_gpu_chunk = 64; // Safe fallback
 
-            const int32_t adaptive_gpu_chunk = std::clamp(
-                128 / std::max(1, n_gpu_layers_),
-                8,
-                64
-            );
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_METAL)
+            adaptive_gpu_chunk = 512;
+#elif defined(GGML_USE_VULKAN)
+            adaptive_gpu_chunk = 64;
+#else
+            // CPU or unknown backend: scale with thread count, capped at 256
+            adaptive_gpu_chunk = std::min(256, std::max(64, n_threads * 16));
+#endif
+
             if (n_tokens > adaptive_gpu_chunk) {
                 chunk_tokens = adaptive_gpu_chunk;
             }
