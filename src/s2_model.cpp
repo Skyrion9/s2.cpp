@@ -1026,11 +1026,9 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
             ggml_tensor * attn_fa = ggml_flash_attn_ext(
                 ctx0, Q, k_cache, v_cache, nullptr, attn_scale, 0.0f, 0.0f);
             
-            ggml_tensor * attn_merged = ggml_permute(ctx0, attn_fa, 0, 2, 1, 3);
-            
-            // ggml_cpy safely handles reading from the permuted view into a fresh 2D tensor.
-            attn_cur = ggml_cpy(ctx0, attn_merged,
-                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
+            // attn_fa is [head_dim, n_head, n_tokens=1, 1]; with n_tokens==1 no reorder is needed.
+            attn_cur = ggml_cpy(ctx0, attn_fa,
+                 ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
         } else {
             // Prefill path (keep concat logic)
             ggml_tensor * k_mem = k;
