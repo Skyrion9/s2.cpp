@@ -183,9 +183,16 @@ static bool allocate_weight_buffers(ggml_backend_t backend,
     return true;
 }
 
-SlowARModel::SlowARModel() {}
+SlowARModel::SlowARModel()
+    : fast_gallocr_(nullptr)
+{}
 
 SlowARModel::~SlowARModel() {
+    if (fast_gallocr_) {
+        ggml_gallocr_free(fast_gallocr_);
+        fast_gallocr_ = nullptr;
+    }
+
     if (fast_sched_)     ggml_backend_sched_free(fast_sched_);
     if (sched_)          ggml_backend_sched_free(sched_);
 
@@ -1223,33 +1230,67 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     ggml_build_forward_expand(gf, logits);
 
     ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
-    ggml_backend_sched_reset(fast_sched_);
 
-    if (!ggml_backend_sched_alloc_graph(fast_sched_, gf)) {
-        std::fprintf(stderr, "[fast_decode] sched alloc failed\n");
+    // If no GPU layers are offloaded, use gallocr cached buffer pool.
+    // If GPU offload is active, use the scheduler to safely handle PCIe transfers.
+    const bool is_cpu_only = (n_gpu_layers_ == 0 || backend_gpu_ == nullptr);
+
+    if (is_cpu_only) {
+        if (!fast_gallocr_) {
+            fast_gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_cpu_));
+            if (!fast_gallocr_) {
+                std::fprintf(stderr, "[fast_decode] gallocr creation failed\n");
+                ggml_free(ctx0);
+                return false;
+            }
+        }
+
+        if (!ggml_gallocr_alloc_graph(fast_gallocr_, gf)) {
+            std::fprintf(stderr, "[fast_decode] gallocr alloc failed\n");
+            ggml_free(ctx0);
+            return false;
+        }
+
+        ggml_backend_tensor_set(hidden0, hidden_in.data(), 0, hidden_in.size() * sizeof(float));
+        ggml_backend_tensor_set(positions, pos_vals.data(), 0, pos_vals.size() * sizeof(int32_t));
+        if (prefix_ids) {
+            ggml_backend_tensor_set(prefix_ids, prefix_tokens.data(), 0, prefix_tokens.size() * sizeof(int32_t));
+        }
+
+        if (ggml_backend_graph_compute(backend_cpu_, gf) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[fast_decode] cpu compute failed\n");
+            ggml_free(ctx0);
+            return false;
+        }
+    } else {
         ggml_backend_sched_reset(fast_sched_);
-        ggml_free(ctx0);
-        return false;
-    }
 
-    ggml_backend_tensor_set(hidden0,   hidden_in.data(),    0, hidden_in.size() * sizeof(float));
-    ggml_backend_tensor_set(positions, pos_vals.data(),     0, pos_vals.size() * sizeof(int32_t));
-    if (prefix_ids) {
-        ggml_backend_tensor_set(prefix_ids, prefix_tokens.data(), 0,
-                                prefix_tokens.size() * sizeof(int32_t));
-    }
+        if (!ggml_backend_sched_alloc_graph(fast_sched_, gf)) {
+            std::fprintf(stderr, "[fast_decode] sched alloc failed\n");
+            ggml_backend_sched_reset(fast_sched_);
+            ggml_free(ctx0);
+            return false;
+        }
 
-    if (ggml_backend_sched_graph_compute(fast_sched_, gf) != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "[fast_decode] sched compute failed\n");
+        ggml_backend_tensor_set(hidden0,   hidden_in.data(),    0, hidden_in.size() * sizeof(float));
+        ggml_backend_tensor_set(positions, pos_vals.data(),     0, pos_vals.size() * sizeof(int32_t));
+        if (prefix_ids) {
+            ggml_backend_tensor_set(prefix_ids, prefix_tokens.data(), 0, prefix_tokens.size() * sizeof(int32_t));
+        }
+
+        if (ggml_backend_sched_graph_compute(fast_sched_, gf) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[fast_decode] sched compute failed\n");
+            ggml_backend_sched_reset(fast_sched_);
+            ggml_free(ctx0);
+            return false;
+        }
+
         ggml_backend_sched_reset(fast_sched_);
-        ggml_free(ctx0);
-        return false;
     }
 
     logits_out.resize(hparams_.codebook_size);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, hparams_.codebook_size * sizeof(float));
 
-    ggml_backend_sched_reset(fast_sched_);
     ggml_free(ctx0);
     return true;
 }
