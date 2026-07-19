@@ -301,91 +301,10 @@ static void sync_tokenizer_config_from_model(Tokenizer& tokenizer, const SlowARM
 }
 
 Pipeline::Pipeline() {}
-Pipeline::~Pipeline() {}
-
-static bool read_all_tensor_data(
-    const std::string & gguf_path,
-    gguf_context * gguf_ctx,
-    s2::SlowARModel & model,
-    s2::AudioCodec & codec)
-{
-    const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-    const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
-
-    std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
-    if (!f) {
-        std::cerr << "[Pipeline] Cannot reopen " << gguf_path << " for data loading." << std::endl;
-        return false;
+Pipeline::~Pipeline() {
+    if (pending_offload_thread_.joinable()) {
+        pending_offload_thread_.join();
     }
-
-    const auto & model_weights = model.weight_tensor_set();
-    ggml_context * codec_ctx = codec.weights_ctx();
-    std::vector<uint8_t> tmp;
-
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * tname = gguf_get_tensor_name(gguf_ctx, ti);
-        const size_t toff  = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
-
-        ggml_tensor * t = ggml_get_tensor(model.weights_ctx(), tname);
-        if (t && model_weights.find(t) != model_weights.end()) {
-            const size_t tsize = ggml_nbytes(t);
-            if (tmp.size() < tsize) tmp.resize(tsize);
-#ifdef _WIN32
-            _fseeki64(f, (int64_t)toff, SEEK_SET);
-#else
-            fseeko(f, (off_t)toff, SEEK_SET);
-#endif
-            if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
-                std::cerr << "[Pipeline] Failed to read tensor: " << tname << std::endl;
-                std::fclose(f);
-                return false;
-            }
-            ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
-            continue;
-        }
-
-        if (codec_ctx) {
-            t = ggml_get_tensor(codec_ctx, tname);
-            if (t) {
-                const size_t tsize = ggml_nbytes(t);
-                if (tmp.size() < tsize) tmp.resize(tsize);
-#ifdef _WIN32
-                _fseeki64(f, (int64_t)toff, SEEK_SET);
-#else
-                fseeko(f, (off_t)toff, SEEK_SET);
-#endif
-                if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
-                    std::cerr << "[Pipeline] Failed to read tensor: " << tname << std::endl;
-                    std::fclose(f);
-                    return false;
-                }
-                ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
-                continue;
-            }
-        }
-
-    }
-    tmp.clear();
-    tmp.shrink_to_fit();
-    std::fclose(f);
-
-    if (!codec.refresh_host_caches()) {
-        std::cerr << "[Pipeline] Failed to refresh codec host caches after weight load." << std::endl;
-        return false;
-    }
-
-#ifdef __linux__
-    {
-        int fd = ::open(gguf_path.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-            ::close(fd);
-        }
-    }
-#endif
-
-    S2_LOG_INFO_STREAM("[Model] Weights loaded. Total tensors: " << n_tensors << std::endl);
-    return true;
 }
 
 bool Pipeline::init(const PipelineParams & params) {
@@ -477,45 +396,64 @@ bool Pipeline::init(const PipelineParams & params) {
             safe_print_ln("Pipeline: loading codec on " + backend_label +
                           " device " + std::to_string(codec_gpu_device) + "...");
         }
+
         codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, codec_gpu_device, codec_backend_type);
+
         if (!codec_loaded) {
             if (codec_backend_type == BackendType::Metal) {
-                safe_print_warn_ln(
-                    "Pipeline warning: codec " + backend_label +
-                    " load failed, falling back to CPU.");
+                safe_print_warn_ln("Pipeline warning: codec " + backend_label + " load failed, falling back to CPU.");
             } else {
-                safe_print_warn_ln(
-                    "Pipeline warning: codec " + backend_label +
-                    " load failed on device " + std::to_string(codec_gpu_device) +
-                    ", falling back to CPU.");
+                safe_print_warn_ln("Pipeline warning: codec " + backend_label + " load failed on device " +
+                                   std::to_string(codec_gpu_device) + ", falling back to CPU.");
             }
         }
     }
+
     if (!codec_loaded) {
         if (!use_gpu_codec) {
             safe_print_ln("Pipeline: loading codec on CPU.");
         }
         codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, -1, BackendType::CPU);
     }
+
     if (!codec_loaded) {
         safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
         gguf_free(shared_gguf);
         return false;
     }
 
-    if (!read_all_tensor_data(params.model_path, shared_gguf, model(), codec())) {
-        safe_print_error_ln("Pipeline error: failed to read tensor data from " + params.model_path);
-        gguf_free(shared_gguf);
-        return false;
-    }
-
     gguf_free(shared_gguf);
 
+    if (!codec().refresh_host_caches_from_mmap()) {
+        safe_print_error_ln("Pipeline error: failed to refresh VQ caches from mmap");
+        return false;
+    }
     const auto codec_t1 = std::chrono::steady_clock::now();
+
+    const auto model_weights_t0 = std::chrono::steady_clock::now();
+    if (!model().allocate_and_load_weights()) {
+        safe_print_error_ln("Pipeline error: failed to allocate and load Slow-AR weights");
+        return false;
+    }
+    const auto model_weights_t1 = std::chrono::steady_clock::now();
 
     sync_tokenizer_config_from_model(tokenizer(), model());
 
     initialized_ = true;
+    
+    model_prefers_gpu_ = model().is_weights_on_gpu();
+    codec_prefers_gpu_ = use_gpu_codec;
+
+    if (model_prefers_gpu_ && codec_prefers_gpu_) {
+        safe_print_ln("[Pipeline] VRAM State Machine: Case 1 (Both prefer GPU) - Codec is lazily allocated on demand.");
+    } else if (model_prefers_gpu_ && !codec_prefers_gpu_) {
+        safe_print_ln("[Pipeline] VRAM State Machine: Case 2 (Slow-AR GPU, Codec CPU) - Ready.");
+    } else if (!model_prefers_gpu_ && codec_prefers_gpu_) {
+        safe_print_ln("[Pipeline] VRAM State Machine: Case 3 (Slow-AR CPU, Codec GPU) - Codec is lazily allocated on demand.");
+    } else {
+        safe_print_ln("[Pipeline] VRAM State Machine: Case 4 (All CPU) - Ready.");
+    }
+
     const auto init_t1 = std::chrono::steady_clock::now();
     safe_print_ln(
         "[Metrics] Init: tokenizer=" +
@@ -524,7 +462,9 @@ bool Pipeline::init(const PipelineParams & params) {
         std::to_string(std::chrono::duration<double, std::milli>(model_t1 - model_t0).count()) +
         " ms, codec=" +
         std::to_string(std::chrono::duration<double, std::milli>(codec_t1 - codec_t0).count()) +
-        " ms (" + codec().backend_name() + "), total=" +
+        " ms (" + codec().backend_name() + "), model_weights=" +
+        std::to_string(std::chrono::duration<double, std::milli>(model_weights_t1 - model_weights_t0).count()) +
+        " ms, total=" +
         std::to_string(std::chrono::duration<double, std::milli>(init_t1 - init_t0).count()) +
         " ms, max_rss=" +
         std::to_string(get_max_rss_mb()) + " MB");
@@ -789,9 +729,28 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
         return false;
     }
 
+    std::thread pre_restore_thread;
+    bool pre_restore_started = false;
+    
+    if (params.enable_vram_swap && params.is_persistent && 
+        model_prefers_gpu_ && !model().is_weights_on_gpu()) {
+        safe_print_ln("[Pipeline] Hot-Swap: Pre-fetching Slow-AR to VRAM in background...");
+        pre_restore_started = true;
+        pre_restore_thread = std::thread([this]() {
+            model().acquire_compute_resources();
+            model().restore_weights_to_gpu();
+        });
+    }
+
     if (!resolve_reference_prompt_locked(params, ref_audio, ref_codes, T_prompt,
                                          effective_prompt_text, ref_encode_ms)) {
+        if (pre_restore_started) pre_restore_thread.join();
         return false;
+    }
+
+    if (pre_restore_started) {
+        pre_restore_thread.join();
+        safe_print_ln("[Pipeline] Hot-Swap: Background pre-fetch complete.");
     }
 
     PipelineParams effective_params = params;
@@ -833,11 +792,42 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         return false;
     }
 
+    if (params.enable_vram_swap) {
+        if (pending_offload_thread_.joinable()) {
+            pending_offload_thread_.join();
+        }
+    }
+
     CodecDecodeCacheScope codec_decode_cache_scope(codec());
     model().clear_kv_cache();
 
     safe_print_ln("--- Pipeline Synthesize ---");
     safe_print_ln("Text: " + params.text);
+
+    if (params.enable_vram_swap) {
+        if (model_prefers_gpu_ && !model().is_weights_on_gpu()) {
+            safe_print_ln("[Pipeline] Restoring Slow-AR to VRAM for generation...");
+            model().acquire_compute_resources();
+            model().restore_weights_to_gpu();
+            safe_print_ln("[VRAM Diag] Post-SlowAR restore: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+        }
+
+        if (!model_prefers_gpu_ && codec_prefers_gpu_ && !codec().is_weights_on_gpu()) {
+            safe_print_ln("[Pipeline] Pre-loading Audio Codec to VRAM (hiding behind CPU gen)...");
+            codec().restore_weights_to_gpu();
+            safe_print_ln("[VRAM Diag] Post-Codec restore: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+        }
+
+        if (model_prefers_gpu_ && codec_prefers_gpu_ && codec().is_weights_on_gpu()) {
+            safe_print_ln("[Pipeline] Freeing Audio Codec from VRAM for Slow-AR generation...");
+            codec().free_gpu_weights();
+            safe_print_ln("[VRAM Diag] Post-Codec free: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+        }
+        
+        safe_print_ln("[VRAM Diag] End-Phase1: Slow-AR=" +
+            std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" +
+            std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+    }
 
     const int32_t num_codebooks = model().hparams().num_codebooks;
 
@@ -863,19 +853,72 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         return false;
     }
 
+    if (params.enable_vram_swap) {
+        if (model_prefers_gpu_ && model().is_weights_on_gpu()) {
+            if (params.is_persistent) {
+                if (codec_prefers_gpu_) {
+                    safe_print_ln("[Pipeline] Freeing Slow-AR from VRAM to make room for GPU Audio Codec...");
+                    model().free_gpu_weights();
+                    model().clear_kv_cache();
+                    safe_print_ln("[VRAM Diag] Post-SlowAR free: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+                }
+            } else {
+                safe_print_ln("[Pipeline] Single-shot: Freeing Slow-AR from VRAM...");
+                model().free_gpu_weights();
+                model().free_compute_buffers(); 
+                safe_print_ln("[VRAM Diag] Post-SlowAR free: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+            }
+        }
+        
+        if (codec_prefers_gpu_ && !codec().is_weights_on_gpu()) {
+            safe_print_ln("[Pipeline] Restoring Audio Codec to VRAM for decode...");
+            codec().restore_weights_to_gpu();
+            safe_print_ln("[VRAM Diag] Post-Codec restore: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+        }
+    }
+
     const int32_t offline_decode_stride_frames =
         params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 16;
     double decode_ms = 0.0;
     int32_t decode_batches = 0;
     const auto decode_t0 = std::chrono::steady_clock::now();
-    if (!decode_codes_windowed(codec(), res.codes.data(), res.n_frames, num_codebooks,
+
+    bool decode_ok = decode_codes_windowed(codec(), res.codes.data(), res.n_frames, num_codebooks,
                                params.gen.n_threads, offline_decode_stride_frames,
                                params.codec_decode_context_frames,
-                               audio_out, &decode_ms, &decode_batches)) {
+                               audio_out, &decode_ms, &decode_batches);
+       
+    const auto decode_t1 = std::chrono::steady_clock::now();
+
+    if (params.enable_vram_swap) {
+        if (params.is_persistent) {
+            if (params.enable_hot_swap) {
+                safe_print_ln("[Pipeline] Hot-Swap: Releasing compute resources...");
+                model().free_compute_buffers();
+                
+                safe_print_ln("[Pipeline] Hot-Swap: Spawning background thread to free VRAM & RAM...");
+                std::thread offload_thread([this]() {
+                    if (model().is_weights_on_gpu()) model().free_gpu_weights();
+                    if (codec().is_weights_on_gpu()) codec().free_gpu_weights();
+                    
+                    model().mapped_file().drop_page_cache();
+                    codec().mapped_file().drop_page_cache();
+                    
+                    safe_print_ln("[Pipeline] Hot-Swap: Background VRAM & RAM free complete.");
+                });
+                pending_offload_thread_ = std::move(offload_thread);
+            } else {
+                if (codec().is_weights_on_gpu()) codec().free_gpu_weights();
+            }
+        } else {
+            safe_print_ln("[Pipeline] Single-shot mode: Skipping post-decode VRAM restore.");
+        }
+    }
+
+    if (!decode_ok) {
         safe_print_error_ln("Pipeline error: decode failed.");
         return false;
     }
-    const auto decode_t1 = std::chrono::steady_clock::now();
 
     model().clear_kv_cache();
     const auto synth_t1 = std::chrono::steady_clock::now();
@@ -908,6 +951,13 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         " ms/frame, gen_rtf=" + std::to_string(gen_rtf) +
         ", total_rtf=" + std::to_string(total_rtf) +
         ", max_rss=" + std::to_string(get_max_rss_mb()) + " MB");
+
+    if (params.enable_vram_swap) {
+        safe_print_ln("[VRAM Diag] Post-Phase3: Slow-AR=" + 
+            std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" +
+            std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+    }
+
     return true;
 }
 
@@ -925,10 +975,29 @@ bool Pipeline::synthesize_streaming_raw(const PipelineParams & params, AudioData
         return false;
     }
 
+    std::thread pre_restore_thread;
+    bool pre_restore_started = false;
+    
+    if (params.enable_vram_swap && params.is_persistent && 
+        model_prefers_gpu_ && !model().is_weights_on_gpu()) {
+        safe_print_ln("[Pipeline] Hot-Swap: Pre-fetching Slow-AR to VRAM in background...");
+        pre_restore_started = true;
+        pre_restore_thread = std::thread([this]() {
+            model().acquire_compute_resources();
+            model().restore_weights_to_gpu();
+        });
+    }
+
     if (!resolve_reference_prompt_locked(params, ref_audio, ref_codes, T_prompt,
                                          effective_prompt_text, ref_encode_ms)) {
+        if (pre_restore_started) pre_restore_thread.join();
         sink.on_error("Failed to resolve reference prompt");
         return false;
+    }
+
+    if (pre_restore_started) {
+        pre_restore_thread.join();
+        safe_print_ln("[Pipeline] Hot-Swap: Background pre-fetch complete.");
     }
 
     PipelineParams effective_params = params;
@@ -961,6 +1030,22 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         safe_print_error_ln("Pipeline not initialized.");
         sink.on_error("Pipeline not initialized");
         return false;
+    }
+
+    if (params.enable_vram_swap) {
+        if (pending_offload_thread_.joinable()) {
+            pending_offload_thread_.join();
+        }
+        
+        if (model_prefers_gpu_ && !model().is_weights_on_gpu()) {
+            safe_print_ln("[Pipeline] Streaming: Restoring Slow-AR to VRAM...");
+            model().acquire_compute_resources();
+            model().restore_weights_to_gpu();
+        }
+        if (codec_prefers_gpu_ && !codec().is_weights_on_gpu()) {
+            safe_print_ln("[Pipeline] Streaming: Restoring Audio Codec to VRAM...");
+            codec().restore_weights_to_gpu();
+        }
     }
 
     CodecDecodeCacheScope codec_decode_cache_scope(codec());
@@ -1176,6 +1261,31 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         " ms/frame, ar_avg=" + std::to_string(ar_ms_per_frame) +
         " ms/frame, total_rtf=" + std::to_string(total_rtf) +
         ", max_rss=" + std::to_string(get_max_rss_mb()) + " MB");
+
+    if (params.enable_vram_swap) {
+        if (params.is_persistent) {
+            if (params.enable_hot_swap) {
+                safe_print_ln("[Pipeline] Hot-Swap: Releasing compute resources...");
+                model().free_compute_buffers();
+                
+                safe_print_ln("[Pipeline] Hot-Swap: Spawning background thread to free VRAM & RAM...");
+                std::thread offload_thread([this]() {
+                    if (model().is_weights_on_gpu()) model().free_gpu_weights();
+                    if (codec().is_weights_on_gpu()) codec().free_gpu_weights();
+                    
+                    model().mapped_file().drop_page_cache();
+                    codec().mapped_file().drop_page_cache();
+                    
+                    safe_print_ln("[Pipeline] Hot-Swap: Background VRAM & RAM free complete.");
+                });
+                pending_offload_thread_ = std::move(offload_thread);
+            } else {
+                if (codec().is_weights_on_gpu()) codec().free_gpu_weights();
+            }
+        } else {
+            safe_print_ln("[Pipeline] Single-shot mode: Skipping post-stream VRAM restore.");
+        }
+    }
     return true;
 }
 

@@ -90,6 +90,8 @@ void print_uso() {
     safe_print("  --codec-auto                Benchmark codec backends and keep the fastest (default)\n");
     safe_print("  --codec-follow-backend      Force codec to follow the selected GPU backend\n");
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
+    safe_print("  --no-vram-swap              Disable phase-gated VRAM swapping between Slow-AR and Codec (keeps both in VRAM simultaneously instead)\n");
+    safe_print("  --hot-swap                  Aggressively evict weights and OS page cache after each server request (~100 MB RAM, ~25 MB VRAM idle)\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
     safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
@@ -194,16 +196,18 @@ int main(int argc, char** argv) {
         else if (arg_lower == "-temp" || arg_lower == "--temp" || arg_lower == "--temperature") { if (i+1 < argc) { try { params.gen.temperature = std::stof(argv[++i]); } catch(...) {} } }
         else if (arg_lower == "-top-p" || arg_lower == "--top-p")      { if (i+1 < argc) { try { params.gen.top_p       = std::stof(argv[++i]); } catch(...) {} } }
         else if (arg_lower == "-top-k" || arg_lower == "--top-k")      { if (i+1 < argc) { try { params.gen.top_k       = std::stoi(argv[++i]); } catch(...) {} } }
-        else if (arg_lower == "--dynamic-normalize")     { params.normalize_dynamic = true;  }
-        else if (arg_lower == "--no-dynamic-normalize")  { params.normalize_dynamic = false; }
-        else if (arg_lower == "--no-trim-silence")  { params.trim_silence     = false; }
-        else if (arg_lower == "--trim-silence")     { params.trim_silence     = true;  }
-        else if (arg_lower == "--no-normalize")     { params.normalize_output = false; }
-        else if (arg_lower == "--normalize")        { params.normalize_output = true;  }
-        else if (arg_lower == "--codec-auto")       { params.codec_auto_backend = true;  params.codec_follow_backend = true;  }
-        else if (arg_lower == "--codec-follow-backend") { params.codec_auto_backend = false; params.codec_follow_backend = true; }
-        else if (arg_lower == "--codec-cpu")        { params.codec_auto_backend = false; params.codec_follow_backend = false; }
-        else if (arg_lower == "--stream-file")      { use_stream_file = true; }
+        else if (arg_lower == "--dynamic-normalize")     { params.normalize_dynamic  = true;  }
+        else if (arg_lower == "--no-dynamic-normalize")  { params.normalize_dynamic  = false; }
+        else if (arg_lower == "--no-trim-silence")       { params.trim_silence       = false; }
+        else if (arg_lower == "--trim-silence")          { params.trim_silence       = true;  }
+        else if (arg_lower == "--no-normalize")          { params.normalize_output   = false; }
+        else if (arg_lower == "--normalize")             { params.normalize_output   = true;  }
+        else if (arg_lower == "--codec-auto")            { params.codec_auto_backend = true;  params.codec_follow_backend = true; }
+        else if (arg_lower == "--codec-follow-backend")  { params.codec_auto_backend = false; params.codec_follow_backend = true; }
+        else if (arg_lower == "--codec-cpu")             { params.codec_auto_backend = false; params.codec_follow_backend = false; }
+        else if (arg_lower == "--no-vram-swap")          { params.enable_vram_swap   = false; }
+        else if (arg_lower == "--hot-swap")              { params.enable_hot_swap    = true; }
+        else if (arg_lower == "--stream-file")           { use_stream_file = true; }
         else if (arg_lower == "--stream-decode-stride") {
             if (i+1 < argc) {
                 try { params.stream_decode_stride_frames = std::stoi(argv[++i]); } catch(...) {}
@@ -317,6 +321,7 @@ int main(int argc, char** argv) {
 
     if (use_server) {
         serverParams.pipeline = params;
+        serverParams.pipeline.is_persistent = true;
         s2::Server server;
         if (!server.serve(serverParams)) {
             safe_print_error("Server initialization failed.\n");

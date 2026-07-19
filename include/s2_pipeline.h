@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <mutex>
+#include <thread>
 
 namespace s2 {
 
@@ -46,6 +47,9 @@ struct PipelineParams {
     std::string voice_id;
     bool save_voice = false;
     std::string voice_storage_dir = "./voices";
+    bool enable_vram_swap = true;
+    bool enable_hot_swap = false;   
+    bool is_persistent = false; 
 };
 
 class Pipeline {
@@ -108,8 +112,11 @@ private:
     Tokenizer* tokenizer_ref_ = &owned_tokenizer_;
     SlowARModel* model_ref_ = &owned_model_;
     AudioCodec* codec_ref_ = &owned_codec_;
+    std::thread pending_offload_thread_;
     mutable std::mutex synthesize_mutex_;
     bool initialized_ = false;
+    bool model_prefers_gpu_ = false;
+    bool codec_prefers_gpu_ = false;
 };
 
 }
