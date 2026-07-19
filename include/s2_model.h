@@ -1,5 +1,6 @@
 #pragma once
 
+#include "s2_mapped_file.h"
 #include "s2_backend.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace s2 {
@@ -98,8 +100,6 @@ public:
 
     bool load_shared(gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1);
 
-    bool read_tensor_data(const std::string & gguf_path, gguf_context * gguf_ctx);
-
     ggml_context * weights_ctx() { return weights_.ctx_w; }
     const std::unordered_set<ggml_tensor *> & weight_tensor_set() const { return weight_tensor_set_; }
 
@@ -108,6 +108,22 @@ public:
     void reset();
 
     void clear_kv_cache();
+
+    MappedFile& mapped_file() { return mapped_gguf_; }
+
+    bool allocate_and_load_weights();
+
+    bool restore_weights_to_gpu();
+
+    bool free_gpu_weights();
+
+    void free_compute_buffers();
+
+    void acquire_compute_resources();
+
+    size_t get_gpu_memory_usage_bytes() const;
+
+    bool is_weights_on_gpu() const { return weights_on_gpu_; }
 
 private:
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
@@ -151,6 +167,16 @@ private:
     std::vector<uint8_t> fast_ctx_buf_;
 
     std::unordered_set<ggml_tensor *> weight_tensor_set_;
+
+    std::string gguf_path_;
+    size_t gguf_data_offset_ = 0;
+    std::unordered_map<ggml_tensor*, size_t> tensor_offsets_;
+    std::vector<ggml_tensor*> original_gpu_weights_;
+    std::vector<ggml_tensor*> original_cpu_weights_;
+    bool weights_on_gpu_ = false;
+    bool weights_allocated_ = false;
+
+    MappedFile mapped_gguf_;
 
 };
 

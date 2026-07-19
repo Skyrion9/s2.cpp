@@ -303,91 +303,6 @@ static void sync_tokenizer_config_from_model(Tokenizer& tokenizer, const SlowARM
 Pipeline::Pipeline() {}
 Pipeline::~Pipeline() {}
 
-static bool read_all_tensor_data(
-    const std::string & gguf_path,
-    gguf_context * gguf_ctx,
-    s2::SlowARModel & model,
-    s2::AudioCodec & codec)
-{
-    const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-    const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
-
-    std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
-    if (!f) {
-        std::cerr << "[Pipeline] Cannot reopen " << gguf_path << " for data loading." << std::endl;
-        return false;
-    }
-
-    const auto & model_weights = model.weight_tensor_set();
-    ggml_context * codec_ctx = codec.weights_ctx();
-    std::vector<uint8_t> tmp;
-
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * tname = gguf_get_tensor_name(gguf_ctx, ti);
-        const size_t toff  = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
-
-        ggml_tensor * t = ggml_get_tensor(model.weights_ctx(), tname);
-        if (t && model_weights.find(t) != model_weights.end()) {
-            const size_t tsize = ggml_nbytes(t);
-            if (tmp.size() < tsize) tmp.resize(tsize);
-#ifdef _WIN32
-            _fseeki64(f, (int64_t)toff, SEEK_SET);
-#else
-            fseeko(f, (off_t)toff, SEEK_SET);
-#endif
-            if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
-                std::cerr << "[Pipeline] Failed to read tensor: " << tname << std::endl;
-                std::fclose(f);
-                return false;
-            }
-            ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
-            continue;
-        }
-
-        if (codec_ctx) {
-            t = ggml_get_tensor(codec_ctx, tname);
-            if (t) {
-                const size_t tsize = ggml_nbytes(t);
-                if (tmp.size() < tsize) tmp.resize(tsize);
-#ifdef _WIN32
-                _fseeki64(f, (int64_t)toff, SEEK_SET);
-#else
-                fseeko(f, (off_t)toff, SEEK_SET);
-#endif
-                if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
-                    std::cerr << "[Pipeline] Failed to read tensor: " << tname << std::endl;
-                    std::fclose(f);
-                    return false;
-                }
-                ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
-                continue;
-            }
-        }
-
-    }
-    tmp.clear();
-    tmp.shrink_to_fit();
-    std::fclose(f);
-
-    if (!codec.refresh_host_caches()) {
-        std::cerr << "[Pipeline] Failed to refresh codec host caches after weight load." << std::endl;
-        return false;
-    }
-
-#ifdef __linux__
-    {
-        int fd = ::open(gguf_path.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-            ::close(fd);
-        }
-    }
-#endif
-
-    S2_LOG_INFO_STREAM("[Model] Weights loaded. Total tensors: " << n_tensors << std::endl);
-    return true;
-}
-
 bool Pipeline::init(const PipelineParams & params) {
     tokenizer_ref_ = &owned_tokenizer_;
     model_ref_ = &owned_model_;
@@ -477,45 +392,51 @@ bool Pipeline::init(const PipelineParams & params) {
             safe_print_ln("Pipeline: loading codec on " + backend_label +
                           " device " + std::to_string(codec_gpu_device) + "...");
         }
+
         codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, codec_gpu_device, codec_backend_type);
+
         if (!codec_loaded) {
             if (codec_backend_type == BackendType::Metal) {
-                safe_print_warn_ln(
-                    "Pipeline warning: codec " + backend_label +
-                    " load failed, falling back to CPU.");
+                safe_print_warn_ln("Pipeline warning: codec " + backend_label + " load failed, falling back to CPU.");
             } else {
-                safe_print_warn_ln(
-                    "Pipeline warning: codec " + backend_label +
-                    " load failed on device " + std::to_string(codec_gpu_device) +
-                    ", falling back to CPU.");
+                safe_print_warn_ln("Pipeline warning: codec " + backend_label + " load failed on device " +
+                                   std::to_string(codec_gpu_device) + ", falling back to CPU.");
             }
         }
     }
+
     if (!codec_loaded) {
         if (!use_gpu_codec) {
             safe_print_ln("Pipeline: loading codec on CPU.");
         }
         codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, -1, BackendType::CPU);
     }
+
     if (!codec_loaded) {
         safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
         gguf_free(shared_gguf);
         return false;
     }
 
-    if (!read_all_tensor_data(params.model_path, shared_gguf, model(), codec())) {
-        safe_print_error_ln("Pipeline error: failed to read tensor data from " + params.model_path);
-        gguf_free(shared_gguf);
-        return false;
-    }
-
     gguf_free(shared_gguf);
 
+    if (!codec().refresh_host_caches_from_mmap()) {
+        safe_print_error_ln("Pipeline error: failed to refresh VQ caches from mmap");
+        return false;
+    }
     const auto codec_t1 = std::chrono::steady_clock::now();
+
+    const auto model_weights_t0 = std::chrono::steady_clock::now();
+    if (!model().allocate_and_load_weights()) {
+        safe_print_error_ln("Pipeline error: failed to allocate and load Slow-AR weights");
+        return false;
+    }
+    const auto model_weights_t1 = std::chrono::steady_clock::now();
 
     sync_tokenizer_config_from_model(tokenizer(), model());
 
     initialized_ = true;
+
     const auto init_t1 = std::chrono::steady_clock::now();
     safe_print_ln(
         "[Metrics] Init: tokenizer=" +
@@ -524,7 +445,9 @@ bool Pipeline::init(const PipelineParams & params) {
         std::to_string(std::chrono::duration<double, std::milli>(model_t1 - model_t0).count()) +
         " ms, codec=" +
         std::to_string(std::chrono::duration<double, std::milli>(codec_t1 - codec_t0).count()) +
-        " ms (" + codec().backend_name() + "), total=" +
+        " ms (" + codec().backend_name() + "), model_weights=" +
+        std::to_string(std::chrono::duration<double, std::milli>(model_weights_t1 - model_weights_t0).count()) +
+        " ms, total=" +
         std::to_string(std::chrono::duration<double, std::milli>(init_t1 - init_t0).count()) +
         " ms, max_rss=" +
         std::to_string(get_max_rss_mb()) + " MB");
