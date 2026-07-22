@@ -48,8 +48,7 @@ GenerateResult generate(
         std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl;
     }
     const auto prefill_t0 = std::chrono::steady_clock::now();
-    // using prefill_fast causes segfault on vulkan with specific architectures (RDNA2 radv gfx 1031)
-    if (!model.prefill(prompt_tm, prompt.cols, params.n_threads, state)) {
+    if (!model.prefill_fast(prompt_tm, prompt.cols, params.n_threads, state)) {
         std::cerr << "[Generate] Prefill failed." << std::endl;
         return out;
     }
