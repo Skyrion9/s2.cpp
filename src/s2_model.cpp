@@ -1043,9 +1043,8 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         ggml_tensor * attn_fa = ggml_flash_attn_ext(
             ctx0, Q_fa, k_cache, v_cache, fa_mask, attn_scale, 0.0f, 0.0f);
         
-        // Output is [head_dim, n_head, n_tokens, 1], flatten to [q_size, n_tokens] for wo
-        ggml_tensor * attn_cur = ggml_cpy(ctx0, attn_fa,
-             ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
+        // Reshape [head_dim, n_head, n_tokens, 1] → [q_size, n_tokens] (zero-copy view)
+        ggml_tensor * attn_cur = ggml_reshape_2d(ctx0, attn_fa, q_size, n_tokens);
 
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:wo");
 
