@@ -16,8 +16,11 @@ bool MappedFile::open(const std::string& path) {
     close();
     
 #ifdef _WIN32
+    // GGUF is mostly sequential
     HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, 
-                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                            nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                            nullptr);
     if (fh == INVALID_HANDLE_VALUE) {
         return false;
     }
@@ -75,7 +78,15 @@ bool MappedFile::open(const std::string& path) {
         return false; 
     }
     
-    ::madvise(addr, size_, MADV_RANDOM);
+    // GGUF is mostly sequential
+    ::madvise(addr, size_, MADV_SEQUENTIAL);
+
+#ifdef __linux__
+    // Huge pages reduce TLB pressure during multi-GB weight loads.
+    ::madvise(addr, size_, MADV_HUGEPAGE);
+    // Exclude from core dumps so we don't write entire model to disk in a crash.
+    ::madvise(addr, size_, MADV_DONTDUMP);
+#endif
     
     data_ = addr; 
     fd_ = fd;
