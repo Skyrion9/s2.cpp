@@ -1284,12 +1284,14 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
             ggml_free(ctx0);
             return false;
         }
-
-        ggml_backend_sched_reset(fast_sched_);
     }
 
     logits_out.resize(hparams_.codebook_size);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, hparams_.codebook_size * sizeof(float));
+
+    if (!is_cpu_only) {
+        ggml_backend_sched_reset(fast_sched_);
+    }
 
     ggml_free(ctx0);
     return true;
