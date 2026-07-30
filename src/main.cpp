@@ -73,7 +73,7 @@ void print_uso() {
     safe_print("  -o, --output       <path>   Output WAV path\n");
     safe_print("  -v, --vulkan     <id>   Vulkan device index (-1 = CPU)\n");
     safe_print("  -c, --cuda       <id>   CUDA device index (-1 = CPU)\n");
-    safe_print("  -M, --metal             Use Metal backend (macOS only)\n");
+    safe_print("  -mt, --metal             Use Metal backend (macOS only)\n");
     safe_print("  -ngl, --gpu-layers  <n>     Transformer layers on GPU (-1 = auto, 0 = CPU only)\n");
     safe_print("  -threads, --threads <n>     CPU threads (0 = auto)\n");
     safe_print("  -max-tokens, --max-tokens <n>  Max tokens to generate\n");
@@ -175,7 +175,7 @@ int main(int argc, char** argv) {
         else if (arg_lower == "-o"  || arg_lower == "--output")       { if (i+1 < argc) params.output_path        = argv[++i]; }
         else if (arg_lower == "-v"  || arg_lower == "--vulkan")       { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = s2::BackendType::Vulkan; } }
         else if (arg_lower == "-c"  || arg_lower == "--cuda")         { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = s2::BackendType::CUDA; } }
-        else if (arg_lower == "-M"  || arg_lower == "--metal")        { params.gpu_device = 0; params.backend_type = s2::BackendType::Metal; }
+        else if (arg_lower == "-mt"  || arg_lower == "--metal")       { params.gpu_device = 0; params.backend_type = s2::BackendType::Metal; }
         else if (arg_lower == "-ngl" || arg_lower == "--gpu-layers")  { if (i+1 < argc) { try { params.n_gpu_layers = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg_lower == "-threads" || arg_lower == "--threads") { if (i+1 < argc) { try { params.gen.n_threads      = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg_lower == "-max-tokens" || arg_lower == "--max-tokens") {
