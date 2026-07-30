@@ -38,6 +38,8 @@ struct PipelineParams {
     int32_t n_gpu_layers = -1;
     bool codec_auto_backend = true;
     bool codec_follow_backend = true;
+    bool fast_decoder_cpu = false;
+    bool codebook_embeddings_cpu = false;
     int32_t stream_decode_stride_frames = 0;
     int32_t stream_holdback_frames = -1;
     int32_t codec_decode_context_frames = -1;
@@ -50,6 +52,7 @@ struct PipelineParams {
     bool enable_vram_swap = true;
     bool enable_hot_swap = false;   
     bool is_persistent = false; 
+    bool more_segments_pending = false;
 };
 
 class Pipeline {

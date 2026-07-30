@@ -90,6 +90,8 @@ void print_uso() {
     safe_print("  --codec-auto                Benchmark codec backends and keep the fastest (default)\n");
     safe_print("  --codec-follow-backend      Force codec to follow the selected GPU backend\n");
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
+    safe_print("  --fast-decoder-cpu          Force the 4-layer fast decoder on CPU (enables cached graph batching, saves ~200-400 MB VRAM at Q4)\n");
+    safe_print("  --codebook-cpu              Force codebook_embeddings on CPU even at full GPU offload (saves ~56 MB VRAM at Q4, costs ~4-5 ms/frame)\n");
     safe_print("  --no-vram-swap              Disable phase-gated VRAM swapping between Slow-AR and Codec (keeps both in VRAM simultaneously instead)\n");
     safe_print("  --hot-swap                  Aggressively evict weights and OS page cache after each server request (~100 MB RAM, ~25 MB VRAM idle)\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
@@ -197,6 +199,8 @@ int main(int argc, char** argv) {
         else if (arg == "--codec-auto")            { params.codec_auto_backend = true;  params.codec_follow_backend = true; }
         else if (arg == "--codec-follow-backend")  { params.codec_auto_backend = false; params.codec_follow_backend = true; }
         else if (arg == "--codec-cpu")             { params.codec_auto_backend = false; params.codec_follow_backend = false; }
+        else if (arg == "--fast-decoder-cpu")      { params.fast_decoder_cpu = true; }
+        else if (arg == "--codebook-cpu")          { params.codebook_embeddings_cpu = true; }
         else if (arg == "--no-vram-swap")          { params.enable_vram_swap   = false; }
         else if (arg == "--hot-swap")              { params.enable_hot_swap    = true; }
         else if (arg == "--stream-file")           { use_stream_file = true; }

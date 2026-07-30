@@ -20,6 +20,7 @@ public:
     bool open(const std::string& path);
     void close();
     void drop_page_cache();
+    void warm_page_cache();
     
     bool is_open() const { return data_ != nullptr; }
     const uint8_t* data() const { return static_cast<const uint8_t*>(data_); }

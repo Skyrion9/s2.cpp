@@ -106,6 +106,14 @@ static bool allocate_weight_buffers(ggml_backend_t backend,
                                     size_t & max_buffer_bytes,
                                     std::string & error_message) {
     free_backend_buffers(out_buffers);
+
+    for (ggml_tensor * tensor : tensors) {
+        if (tensor) {
+            tensor->data   = nullptr;
+            tensor->buffer = nullptr;
+        }
+    }
+
     total_bytes = 0;
     max_buffer_bytes = 0;
     error_message.clear();
@@ -202,7 +210,7 @@ SlowARModel::~SlowARModel() {
     weights_.ctx_w = nullptr;
 }
 
-bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers) {
+bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers, bool fast_decoder_cpu, bool codebook_embeddings_cpu) {
 
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
@@ -313,6 +321,9 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
         n_gpu_layers = hparams_.block_count;
     }
     n_gpu_layers_ = n_gpu_layers;
+    fast_decoder_cpu_ = fast_decoder_cpu;
+    codebook_embeddings_cpu_ = codebook_embeddings_cpu;
+
     S2_LOG_INFO_STREAM("[Model] GPU layers: " << n_gpu_layers_ << " / " << hparams_.block_count << std::endl);
 
     if (n_gpu_layers_ > 0 && wants_gpu_backend) {
@@ -496,6 +507,15 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
         n_gpu_layers_ == hparams_.block_count;
 
     auto get_weight_backend = [&](const std::string & name) -> ggml_backend_t {
+        if (fast_decoder_cpu_ &&
+            (name.rfind("fast_layers.", 0) == 0 ||
+            name.rfind("fast_", 0) == 0)) {
+            return backend_cpu_;
+        }
+
+        if (codebook_embeddings_cpu_ && name == "codebook_embeddings.weight") {
+            return backend_cpu_;
+        }
 
         if (full_model_offload) {
             return backend_gpu_;
@@ -549,14 +569,14 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
     return true;
 }
 
-bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers) {
+bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers, bool fast_decoder_cpu, bool codebook_embeddings_cpu) {
     struct gguf_init_params params = { true, nullptr };
     gguf_context * ctx_gguf = gguf_init_from_file(gguf_path.c_str(), params);
     if (!ctx_gguf) {
         std::cerr << "[Model] Failed to load GGUF from " << gguf_path << std::endl;
         return false;
     }
-    if (!load_shared(ctx_gguf, gguf_path, gpu_device, backend_type, n_gpu_layers)) {
+    if (!load_shared(ctx_gguf, gguf_path, gpu_device, backend_type, n_gpu_layers, fast_decoder_cpu, codebook_embeddings_cpu)) {
         gguf_free(ctx_gguf);
         return false;
     }
