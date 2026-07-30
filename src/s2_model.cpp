@@ -942,14 +942,34 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     ggml_tensor * x = ggml_get_rows(ctx0, weights_.embeddings, semantic_ids);
     if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx0, x, GGML_TYPE_F32);
 
-    std::vector<ggml_tensor *> cb_id_tensors(hparams_.num_codebooks);
-    ggml_tensor * codebook_sum = nullptr;
-    for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
+    const int32_t num_cb = hparams_.num_codebooks;
+    std::vector<ggml_tensor *> cb_id_tensors(num_cb);
+    std::vector<ggml_tensor *> cb_embs(num_cb);
+
+    for (int32_t cb = 0; cb < num_cb; ++cb) {
         ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         cb_id_tensors[cb] = ids;
         ggml_tensor * emb = ggml_get_rows(ctx0, weights_.codebook_embeddings, ids);
         if (emb->type != GGML_TYPE_F32) emb = ggml_cast(ctx0, emb, GGML_TYPE_F32);
-        codebook_sum = (codebook_sum == nullptr) ? emb : ggml_add(ctx0, codebook_sum, emb);
+        cb_embs[cb] = emb;
+    }
+
+    ggml_tensor * codebook_sum = nullptr;
+    if (num_cb > 0) {
+        std::vector<ggml_tensor *> level(cb_embs.begin(), cb_embs.end());
+        while (level.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            next.reserve((level.size() + 1) / 2);
+            for (size_t i = 0; i < level.size(); i += 2) {
+                if (i + 1 < level.size()) {
+                    next.push_back(ggml_add(ctx0, level[i], level[i + 1]));
+                } else {
+                    next.push_back(level[i]);
+                }
+            }
+            level = std::move(next);
+        }
+        codebook_sum = level[0];
     }
 
     if (codebook_sum != nullptr) {
@@ -1022,8 +1042,8 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
             layer_off_v + token_off_v);
             
         // Permute k and v to match the cache layout
-        ggml_tensor * k_perm = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
-        ggml_tensor * v_perm = ggml_cont(ctx0, ggml_permute(ctx0, v, 0, 2, 1, 3));
+        ggml_tensor * k_perm = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        ggml_tensor * v_perm = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_perm, k_slot));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_perm, v_slot));
