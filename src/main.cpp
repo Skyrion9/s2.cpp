@@ -94,6 +94,8 @@ void print_uso() {
     safe_print("  --codebook-cpu              Force codebook_embeddings on CPU even at full GPU offload (saves ~56 MB VRAM at Q4, costs ~4-5 ms/frame)\n");
     safe_print("  --no-vram-swap              Disable phase-gated VRAM swapping between Slow-AR and Codec (keeps both in VRAM simultaneously instead)\n");
     safe_print("  --hot-swap                  Aggressively evict weights and OS page cache after each server request (~100 MB RAM, ~25 MB VRAM idle)\n");
+    safe_print("  --no-kv-reuse               Disable KV cache reuse and prompt prefill caching (old per-request free/realloc behavior)\n");
+    safe_print("  --kv-cache-vram             Pin prefill cache in VRAM between requests (default: system RAM, lower VRAM usage)\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
     safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
@@ -203,6 +205,8 @@ int main(int argc, char** argv) {
         else if (arg == "--codebook-cpu")          { params.codebook_embeddings_cpu = true; }
         else if (arg == "--no-vram-swap")          { params.enable_vram_swap   = false; }
         else if (arg == "--hot-swap")              { params.enable_hot_swap    = true; }
+        else if (arg == "--no-kv-reuse")           { params.enable_kv_reuse    = false; }
+        else if (arg == "--kv-cache-vram")         { params.kv_cache_vram      = true; }
         else if (arg == "--stream-file")           { use_stream_file = true; }
         else if (arg == "--stream-decode-stride") {
             if (i+1 < argc) {

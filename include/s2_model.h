@@ -109,6 +109,16 @@ public:
 
     void clear_kv_cache();
 
+    void    reset_kv_cache();
+    int32_t kv_max_seq_len() const { return max_seq_len_; }
+    int32_t n_past()           const { return n_past_; }
+    void    set_n_past(int32_t n)    { n_past_ = n; }
+    bool    save_kv_state(std::vector<uint8_t> & k_out, std::vector<uint8_t> & v_out,
+                          int32_t n_positions);
+    bool    restore_kv_state(const std::vector<uint8_t> & k_data,
+                             const std::vector<uint8_t> & v_data,
+                             int32_t n_past);
+
     MappedFile& mapped_file() { return mapped_gguf_; }
 
     bool allocate_and_load_weights();

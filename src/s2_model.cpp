@@ -660,6 +660,80 @@ void SlowARModel::clear_kv_cache() {
     max_seq_len_ = 0;
     n_past_ = 0;
 }
+void SlowARModel::reset_kv_cache() {
+    if (memory_k_ && kv_buf_) {
+        ggml_backend_tensor_memset(memory_k_, 0, 0, ggml_nbytes(memory_k_));
+        ggml_backend_tensor_memset(memory_v_, 0, 0, ggml_nbytes(memory_v_));
+    }
+    n_past_ = 0;
+}
+
+bool SlowARModel::save_kv_state(std::vector<uint8_t> & k_out,
+                                std::vector<uint8_t> & v_out,
+                                int32_t n_positions) {
+    if (!memory_k_ || !memory_v_ || n_positions <= 0) return false;
+    if (n_positions > max_seq_len_) return false;
+
+    const int32_t n_layer   = hparams_.block_count;
+    const int32_t n_head_kv = hparams_.head_count_kv;
+
+    const size_t pos_bytes = static_cast<size_t>(n_positions) * memory_k_->nb[1];
+    const size_t out_bytes = static_cast<size_t>(n_layer) * n_head_kv * pos_bytes;
+
+    const size_t full_bytes = ggml_nbytes(memory_k_);
+    std::vector<uint8_t> k_full(full_bytes);
+    std::vector<uint8_t> v_full(full_bytes);
+    ggml_backend_tensor_get(memory_k_, k_full.data(), 0, full_bytes);
+    ggml_backend_tensor_get(memory_v_, v_full.data(), 0, full_bytes);
+
+    k_out.resize(out_bytes);
+    v_out.resize(out_bytes);
+    size_t out_offset = 0;
+    for (int32_t l = 0; l < n_layer; ++l) {
+        for (int32_t h = 0; h < n_head_kv; ++h) {
+            const size_t src = static_cast<size_t>(l) * memory_k_->nb[3]
+                             + static_cast<size_t>(h) * memory_k_->nb[2];
+            std::memcpy(k_out.data() + out_offset, k_full.data() + src, pos_bytes);
+            std::memcpy(v_out.data() + out_offset, v_full.data() + src, pos_bytes);
+            out_offset += pos_bytes;
+        }
+    }
+    return true;
+}
+
+bool SlowARModel::restore_kv_state(const std::vector<uint8_t> & k_data,
+                                   const std::vector<uint8_t> & v_data,
+                                   int32_t n_past) {
+    if (!memory_k_ || !memory_v_) return false;
+
+    const int32_t n_layer   = hparams_.block_count;
+    const int32_t n_head_kv = hparams_.head_count_kv;
+    const size_t pos_bytes  = static_cast<size_t>(n_past) * memory_k_->nb[1];
+    const size_t expected   = static_cast<size_t>(n_layer) * n_head_kv * pos_bytes;
+    if (k_data.size() != expected || v_data.size() != expected) return false;
+
+    const size_t full_bytes = ggml_nbytes(memory_k_);
+    std::vector<uint8_t> k_full(full_bytes, 0);
+    std::vector<uint8_t> v_full(full_bytes, 0);
+
+    size_t in_offset = 0;
+    for (int32_t l = 0; l < n_layer; ++l) {
+        for (int32_t h = 0; h < n_head_kv; ++h) {
+            const size_t dst = static_cast<size_t>(l) * memory_k_->nb[3]
+                             + static_cast<size_t>(h) * memory_k_->nb[2];
+            std::memcpy(k_full.data() + dst, k_data.data() + in_offset, pos_bytes);
+            std::memcpy(v_full.data() + dst, v_data.data() + in_offset, pos_bytes);
+            in_offset += pos_bytes;
+        }
+    }
+
+    ggml_backend_tensor_set(memory_k_, k_full.data(), 0, full_bytes);
+    ggml_backend_tensor_set(memory_v_, v_full.data(), 0, full_bytes);
+
+    n_past_ = n_past;
+    return true;
+}
+
 bool SlowARModel::prefill_fast(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                           int32_t n_threads, StepResult & result) {
     return eval_cached(flat_tokens, n_tokens, n_threads, result);
