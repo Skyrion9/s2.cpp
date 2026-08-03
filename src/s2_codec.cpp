@@ -65,7 +65,6 @@ struct AudioCodec::Impl {
     ggml_backend_t        backend     = nullptr;
     ggml_backend_t        backend_cpu = nullptr;
     ggml_context *        ctx_w       = nullptr;
-    ggml_backend_buffer_t model_buf   = nullptr;
     std::string tprefix;
 
     int32_t sample_rate   = 0;
@@ -107,13 +106,23 @@ struct AudioCodec::Impl {
     codec_decode_cache decode_cache;
     std::string gguf_path;
     size_t gguf_data_offset = 0;
-    std::unordered_map<ggml_tensor*, size_t> tensor_offsets;
     std::vector<ggml_tensor*> original_gpu_weights;
     std::vector<ggml_tensor*> original_cpu_weights;
-    std::vector<ggml_tensor*> all_codec_weights;
-    bool weights_on_gpu = false;
     MappedFile mapped_gguf_;
+
+    std::unordered_map<ggml_tensor*, size_t> tensor_offsets;
     bool weights_allocated_ = false;
+    std::vector<ggml_tensor*> all_codec_weights;
+    std::vector<ggml_tensor*> encoder_weights;
+    std::vector<ggml_tensor*> decoder_weights;
+
+    ggml_backend_buffer_t model_buf   = nullptr;
+    ggml_backend_buffer_t encoder_buf = nullptr;
+    ggml_backend_buffer_t decoder_buf = nullptr;
+
+    bool weights_on_gpu  = false;
+    bool encoder_on_gpu  = false;
+    bool decoder_on_gpu  = false;
 };
 
 static const char * backend_type_name(BackendType backend_type) {
@@ -192,6 +201,14 @@ static void reset_decode_cache(codec_decode_cache & cache, bool preserve_failed_
 
 static void reset_codec_impl(AudioCodec::Impl & impl) {
     reset_decode_cache(impl.decode_cache, false);
+    if (impl.encoder_buf) {
+        ggml_backend_buffer_free(impl.encoder_buf);
+        impl.encoder_buf = nullptr;
+    }
+    if (impl.decoder_buf) {
+        ggml_backend_buffer_free(impl.decoder_buf);
+        impl.decoder_buf = nullptr;
+    }
     if (impl.model_buf) {
         ggml_backend_buffer_free(impl.model_buf);
         impl.model_buf = nullptr;
@@ -748,6 +765,13 @@ void AudioCodec::clear_decode_cache() {
     }
 }
 
+static bool is_encoder_tensor(const std::string & name, const std::string & tprefix) {
+    if (name.find(tprefix + "encoder.") != std::string::npos) return true;
+    if (name.find(tprefix + "quantizer.pre_module.") != std::string::npos) return true;
+    if (name.find(tprefix + "quantizer.downsample.") != std::string::npos) return true;
+    return false;
+}
+
 bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type) {
     if (!impl_) {
         impl_ = new Impl();
@@ -942,6 +966,8 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
         const auto & model_weights = Model ? Model->weight_tensor_set() : std::unordered_set<ggml_tensor*>();
 
         impl_->all_codec_weights.clear();
+        impl_->encoder_weights.clear();
+        impl_->decoder_weights.clear();
         impl_->tensor_offsets.clear();
         impl_->original_gpu_weights.clear();
         impl_->original_cpu_weights.clear();
@@ -950,12 +976,17 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
             const char * tname = gguf_get_tensor_name(shared_gguf_ctx, ti);
             ggml_tensor * t = ggml_get_tensor(impl_->ctx_w, tname);
             if (!t) continue;
-
-            // Skip tensors that belong to the SlowAR Model
             if (Model && model_weights.find(t) != model_weights.end()) continue;
 
             impl_->all_codec_weights.push_back(t);
             impl_->tensor_offsets[t] = gguf_get_tensor_offset(shared_gguf_ctx, ti);
+
+            std::string name_str(tname);
+            if (is_encoder_tensor(name_str, impl_->tprefix)) {
+                impl_->encoder_weights.push_back(t);
+            } else {
+                impl_->decoder_weights.push_back(t);
+            }
 
             if (!ggml_backend_is_cpu(impl_->backend)) {
                 impl_->original_gpu_weights.push_back(t);
@@ -965,6 +996,8 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
         }
 
         impl_->weights_on_gpu = false;
+        impl_->encoder_on_gpu = false;
+        impl_->decoder_on_gpu = false;
 
         impl_->mapped_gguf_.open(gguf_path);
         if (!impl_->mapped_gguf_.is_open()) {
@@ -1483,25 +1516,24 @@ bool AudioCodec::is_weights_on_gpu() const {
 }
 
 bool AudioCodec::free_gpu_weights() {
-    if (!impl_ || !impl_->weights_on_gpu) return true;
-    
+    if (!impl_) return true;
+    if (impl_->encoder_on_gpu) free_encoder_weights();
+    if (impl_->decoder_on_gpu) free_decoder_weights();
+    if (!impl_->weights_on_gpu && !impl_->model_buf) return true;
     S2_LOG_INFO_STREAM("[Codec] >>> FREEING Audio Codec GPU weights..." << std::endl);
     const auto t0 = std::chrono::steady_clock::now();
-    
     ggml_backend_synchronize(impl_->backend);
-
     if (impl_->model_buf) {
         ggml_backend_buffer_free(impl_->model_buf);
         impl_->model_buf = nullptr;
     }
-    
     for (ggml_tensor * t : impl_->all_codec_weights) {
         if (t) { t->data = nullptr; t->buffer = nullptr; }
     }
-    
     impl_->weights_allocated_ = false;
     impl_->weights_on_gpu = false;
-    
+    impl_->encoder_on_gpu = false;
+    impl_->decoder_on_gpu = false;
     const auto t1 = std::chrono::steady_clock::now();
     const double free_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     S2_LOG_INFO_STREAM("[Codec] <<< Audio Codec GPU weights FREED in " << free_ms << " ms" << std::endl);
@@ -1520,9 +1552,126 @@ bool AudioCodec::restore_weights_to_gpu() {
     return true;
 }
 
+bool AudioCodec::free_encoder_weights() {
+    if (!impl_ || !impl_->encoder_on_gpu) return true;
+    S2_LOG_INFO_STREAM("[Codec] >>> FREEING encoder GPU weights..." << std::endl);
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_synchronize(impl_->backend);
+    if (impl_->encoder_buf) {
+        ggml_backend_buffer_free(impl_->encoder_buf);
+        impl_->encoder_buf = nullptr;
+    }
+    for (ggml_tensor * t : impl_->encoder_weights) {
+        if (t) { t->data = nullptr; t->buffer = nullptr; }
+    }
+    impl_->encoder_on_gpu = false;
+    impl_->weights_allocated_ = false;
+    const auto t1 = std::chrono::steady_clock::now();
+    const double enc_free_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    S2_LOG_INFO_STREAM("[Codec] <<< Encoder FREED in " << enc_free_ms << " ms" << std::endl);
+    return true;
+}
+
+bool AudioCodec::restore_encoder_weights() {
+    if (!impl_ || impl_->encoder_on_gpu || impl_->encoder_weights.empty()) return true;
+    if (ggml_backend_is_cpu(impl_->backend)) return true;
+    if (!impl_->mapped_gguf_.is_open()) return false;
+    S2_LOG_INFO_STREAM("[Codec] >>> RESTORING encoder weights to GPU..." << std::endl);
+    const auto t0 = std::chrono::steady_clock::now();
+
+    size_t b = 0; std::string e;
+    if (!allocate_codec_buffers(impl_->backend, impl_->encoder_weights, impl_->encoder_buf, b, e)) {
+        std::cerr << "[Codec] Encoder alloc failed: " << e << std::endl;
+        return false;
+    }
+    const uint8_t * base = impl_->mapped_gguf_.data();
+    for (ggml_tensor * t : impl_->encoder_weights) {
+        auto it = impl_->tensor_offsets.find(t);
+        if (it != impl_->tensor_offsets.end())
+            ggml_backend_tensor_set(t, base + impl_->gguf_data_offset + it->second, 0, ggml_nbytes(t));
+    }
+    impl_->encoder_on_gpu = true;
+    const auto t1 = std::chrono::steady_clock::now();
+    const double enc_restore_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    S2_LOG_INFO_STREAM("[Codec] <<< Encoder RESTORED in " << enc_restore_ms << " ms" << std::endl);
+    return true;
+}
+
+bool AudioCodec::free_decoder_weights() {
+    if (!impl_ || !impl_->decoder_on_gpu) return true;
+    S2_LOG_INFO_STREAM("[Codec] >>> FREEING decoder GPU weights..." << std::endl);
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_synchronize(impl_->backend);
+    if (impl_->decoder_buf) {
+        ggml_backend_buffer_free(impl_->decoder_buf);
+        impl_->decoder_buf = nullptr;
+    }
+    for (ggml_tensor * t : impl_->decoder_weights) {
+        if (t) { t->data = nullptr; t->buffer = nullptr; }
+    }
+    impl_->decoder_on_gpu = false;
+    impl_->weights_allocated_ = false;
+
+    reset_decode_cache(impl_->decode_cache, false);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double dec_free_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    S2_LOG_INFO_STREAM("[Codec] <<< Decoder FREED in " << dec_free_ms << " ms" << std::endl);
+    return true;
+}
+
+bool AudioCodec::restore_decoder_weights() {
+    if (!impl_ || impl_->decoder_on_gpu || impl_->decoder_weights.empty()) return true;
+    if (ggml_backend_is_cpu(impl_->backend)) return true;
+    if (!impl_->mapped_gguf_.is_open()) return false;
+    S2_LOG_INFO_STREAM("[Codec] >>> RESTORING decoder weights to GPU..." << std::endl);
+    const auto t0 = std::chrono::steady_clock::now();
+
+    size_t b = 0; std::string e;
+    if (!allocate_codec_buffers(impl_->backend, impl_->decoder_weights, impl_->decoder_buf, b, e)) {
+        std::cerr << "[Codec] Decoder alloc failed: " << e << std::endl;
+        return false;
+    }
+    const uint8_t * base = impl_->mapped_gguf_.data();
+    for (ggml_tensor * t : impl_->decoder_weights) {
+        auto it = impl_->tensor_offsets.find(t);
+        if (it != impl_->tensor_offsets.end())
+            ggml_backend_tensor_set(t, base + impl_->gguf_data_offset + it->second, 0, ggml_nbytes(t));
+    }
+    impl_->decoder_on_gpu = true;
+    const auto t1 = std::chrono::steady_clock::now();
+    const double dec_restore_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    S2_LOG_INFO_STREAM("[Codec] <<< Decoder RESTORED in " << dec_restore_ms << " ms" << std::endl);
+    return true;
+}
+
+bool AudioCodec::is_encoder_on_gpu() const {
+    return impl_ ? impl_->encoder_on_gpu : false;
+}
+
+bool AudioCodec::is_decoder_on_gpu() const {
+    return impl_ ? impl_->decoder_on_gpu : false;
+}
+
+size_t AudioCodec::get_encoder_gpu_bytes() const {
+    if (!impl_ || !impl_->encoder_buf || !impl_->encoder_on_gpu) return 0;
+    return ggml_backend_buffer_get_size(impl_->encoder_buf);
+}
+
+size_t AudioCodec::get_decoder_gpu_bytes() const {
+    if (!impl_ || !impl_->decoder_buf || !impl_->decoder_on_gpu) return 0;
+    return ggml_backend_buffer_get_size(impl_->decoder_buf);
+}
+
 size_t AudioCodec::get_gpu_memory_usage_bytes() const {
-    if (!impl_ || !impl_->model_buf || !impl_->weights_on_gpu) return 0;
-    return ggml_backend_buffer_get_size(impl_->model_buf);
+    if (!impl_) return 0;
+    size_t total = 0;
+    if (impl_->model_buf && impl_->weights_on_gpu)
+        total += ggml_backend_buffer_get_size(impl_->model_buf);
+    if (impl_->encoder_buf && impl_->encoder_on_gpu)
+        total += ggml_backend_buffer_get_size(impl_->encoder_buf);
+    if (impl_->decoder_buf && impl_->decoder_on_gpu)
+        total += ggml_backend_buffer_get_size(impl_->decoder_buf);
+    return total;
 }
 
 bool AudioCodec::refresh_host_caches_from_mmap() {
@@ -1567,6 +1716,10 @@ bool AudioCodec::refresh_host_caches_from_mmap() {
 
 bool AudioCodec::ensure_weights_loaded() {
     if (!impl_ || impl_->weights_allocated_) return true;
+    if (impl_->decoder_on_gpu || impl_->encoder_on_gpu) {
+        impl_->weights_allocated_ = true;
+        return true;
+    }
     if (!impl_->mapped_gguf_.is_open()) return false;
     S2_LOG_INFO_STREAM("[Codec] >>> Allocating and loading Audio Codec weights on demand..." << std::endl);
     size_t b = 0; std::string e;
@@ -1581,6 +1734,8 @@ bool AudioCodec::ensure_weights_loaded() {
     }
     impl_->weights_allocated_ = true;
     impl_->weights_on_gpu = !ggml_backend_is_cpu(impl_->backend);
+    impl_->encoder_on_gpu = impl_->weights_on_gpu;
+    impl_->decoder_on_gpu = impl_->weights_on_gpu;
     return true;
 }
 
