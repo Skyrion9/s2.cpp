@@ -7,6 +7,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
+#include "s2_sampler.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
@@ -139,10 +140,17 @@ public:
     bool step(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
               StepResult & result);
 
-    bool fast_decode(const std::vector<float> & hidden,
-                     const std::vector<int32_t> & prefix_codes,
+    bool fast_decode(const std::vector<float> & hidden_in,
+                     const std::vector<int32_t> & prefix_tokens,
                      int32_t n_threads,
                      std::vector<float> & logits_out);
+
+    bool fast_decode_batch(
+        const std::vector<float> & hidden_in,
+        int32_t semantic_code,
+        int32_t n_threads,
+        const SamplerParams & sparams,
+        std::vector<int32_t> & codebooks_out);
 
     const ModelHParams & hparams() const { return hparams_; }
 
@@ -179,6 +187,27 @@ private:
 
     MappedFile mapped_gguf_;
 
+    bool fast_decoder_cpu_ = false;
+
+    struct FastGraphSlot {
+        ggml_context   * ctx        = nullptr;
+        ggml_cgraph    * gf         = nullptr;
+        ggml_tensor    * hidden0    = nullptr;
+        ggml_tensor    * prefix_ids = nullptr;
+        ggml_tensor    * positions  = nullptr;
+        ggml_tensor    * logits     = nullptr;
+        ggml_tensor    * logits_all = nullptr;
+        ggml_gallocr_t   allocr     = nullptr;
+        int32_t          n_tokens   = 0;
+        bool             valid      = false;
+    };
+
+    FastGraphSlot        fast_slot_;
+    std::vector<uint8_t> fast_slot_buf_;
+    size_t               fast_slot_buf_size_ = 0;
+
+    std::vector<FastGraphSlot> fast_slots_;
+    
 };
 
 }
