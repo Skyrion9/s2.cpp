@@ -53,6 +53,8 @@ struct PipelineParams {
     bool enable_hot_swap = false;   
     bool is_persistent = false; 
     bool more_segments_pending = false;
+    bool enable_kv_reuse = true;
+    bool kv_cache_vram = false;
 };
 
 class Pipeline {
@@ -120,6 +122,22 @@ private:
     bool initialized_ = false;
     bool model_prefers_gpu_ = false;
     bool codec_prefers_gpu_ = false;
+
+    struct PrefillCacheEntry {
+        std::string cache_key;
+        int32_t n_past = 0;
+        int32_t max_seq_len = 0;
+        StepResult state;
+        std::vector<uint8_t> k_data;
+        std::vector<uint8_t> v_data;
+        bool vram_resident = false;
+        bool valid = false;
+    };
+    PrefillCacheEntry prefill_cache_;
+
+    static std::string compute_prefill_cache_key(const PipelineParams & params,
+                                                  const int32_t * ref_codes,
+                                                  int32_t T_prompt);
 };
 
 }

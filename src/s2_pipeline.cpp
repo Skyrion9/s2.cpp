@@ -302,6 +302,25 @@ static void sync_tokenizer_config_from_model(Tokenizer& tokenizer, const SlowARM
     if (hp.vocab_size        > 0) tc.vocab_size        = hp.vocab_size;
 }
 
+std::string Pipeline::compute_prefill_cache_key(const PipelineParams & params,
+                                                 const int32_t * ref_codes,
+                                                 int32_t T_prompt) {
+    std::string key;
+    if (!params.voice_id.empty()) {
+        key = "voice:" + params.voice_id;
+    } else if (ref_codes && T_prompt > 0) {
+        key = "prompt:" + params.prompt_text;
+        const int32_t n = std::min(T_prompt, 16);
+        for (int32_t t = 0; t < n; ++t)
+            key += "," + std::to_string(ref_codes[t]);
+    } else {
+        key = "noprompt";
+    }
+
+    key += "|" + params.text;
+    return key;
+}
+
 Pipeline::Pipeline() {}
 Pipeline::~Pipeline() {
     if (pending_offload_thread_.joinable()) {
@@ -863,15 +882,30 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         ref_codes, num_codebooks, T_prompt);
     int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
 
-    model().clear_kv_cache();
+    const bool kv_reuse = params.enable_kv_reuse && params.is_persistent;
+    const bool keep_kv_on_gpu = kv_reuse && params.kv_cache_vram;
+
+    const bool need_fresh_kv = !kv_reuse ||
+        model().kv_max_seq_len() < max_seq_len ||
+        model().kv_max_seq_len() == 0;
+
+    if (need_fresh_kv) {
+        model().clear_kv_cache();
+    }
 
     const auto kv_t0 = std::chrono::steady_clock::now();
     std::thread kv_init_thread;
     bool kv_init_ok = true;
 
-    kv_init_thread = std::thread([&]() {
-        kv_init_ok = model().init_kv_cache(max_seq_len);
-    });
+    if (need_fresh_kv) {
+        kv_init_thread = std::thread([&]() {
+            kv_init_ok = model().init_kv_cache(max_seq_len);
+        });
+    } else {
+        kv_init_thread = std::thread([&]() {
+            model().reset_kv_cache();
+        });
+    }
 
     if (vram_phase1_thread.joinable()) {
         vram_phase1_thread.join();
@@ -888,6 +922,77 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
     }
 
     const auto kv_t1 = std::chrono::steady_clock::now();
+
+    const std::string cache_key = compute_prefill_cache_key(params, ref_codes, T_prompt);
+    bool prefill_hit = false;
+    StepResult cached_state;
+
+    if (kv_reuse && prefill_cache_.valid &&
+        prefill_cache_.cache_key == cache_key &&
+        prefill_cache_.max_seq_len >= max_seq_len)
+    {
+        if (keep_kv_on_gpu && prefill_cache_.vram_resident) {
+            model().set_n_past(prefill_cache_.n_past);
+            cached_state = prefill_cache_.state;
+            prefill_hit = true;
+            safe_print_ln("[Pipeline] Prefill cache HIT (VRAM-pinned, key=" + cache_key + ")");
+        } else if (!keep_kv_on_gpu && !prefill_cache_.k_data.empty()) {
+            if (model().restore_kv_state(prefill_cache_.k_data, prefill_cache_.v_data,
+                                         prefill_cache_.n_past)) {
+                cached_state = prefill_cache_.state;
+                prefill_hit = true;
+                safe_print_ln("[Pipeline] Prefill cache HIT (system RAM, key=" + cache_key + ")");
+            }
+        }
+    }
+
+    StepResult prefill_state;
+    double prefill_ms = 0.0;
+    std::thread kv_save_thread;
+
+    if (!prefill_hit) {
+        const int32_t rows = prompt.rows;
+        const int32_t cols = prompt.cols;
+        std::vector<int32_t> prompt_tm(static_cast<size_t>(rows) * cols);
+        for (int32_t r = 0; r < rows; ++r)
+            for (int32_t c = 0; c < cols; ++c)
+                prompt_tm[static_cast<size_t>(c) * rows + r] =
+                    prompt.data[static_cast<size_t>(r) * cols + c];
+
+        safe_print_ln("[Generate] Prefilling " + std::to_string(prompt.cols) + " tokens...");
+        const auto pf_t0 = std::chrono::steady_clock::now();
+        if (!model().prefill_fast(prompt_tm, prompt.cols, params.gen.n_threads, prefill_state)) {
+            safe_print_error_ln("Pipeline error: prefill failed.");
+            return false;
+        }
+        const auto pf_t1 = std::chrono::steady_clock::now();
+        prefill_ms = std::chrono::duration<double, std::milli>(pf_t1 - pf_t0).count();
+
+        if (kv_reuse) {
+            prefill_cache_.cache_key   = cache_key;
+            prefill_cache_.n_past      = model().n_past();
+            prefill_cache_.max_seq_len = model().kv_max_seq_len();
+            prefill_cache_.state       = prefill_state;
+            prefill_cache_.vram_resident = false;
+            prefill_cache_.k_data.clear();
+            prefill_cache_.v_data.clear();
+
+            if (keep_kv_on_gpu) {
+                prefill_cache_.vram_resident = true;
+            } else {
+                const int32_t save_n_past = prefill_cache_.n_past;
+                kv_save_thread = std::thread([this, save_n_past]() {
+                    model().save_kv_state(prefill_cache_.k_data,
+                                          prefill_cache_.v_data,
+                                          save_n_past);
+                });
+            }
+            prefill_cache_.valid = true;
+            safe_print_ln("[Pipeline] Prefill cache SAVED (key=" + cache_key +
+                          ", n_past=" + std::to_string(prefill_cache_.n_past) +
+                          (keep_kv_on_gpu ? ", VRAM)" : ", RAM, async)"));
+        }
+    }
 
     const bool can_overlap_decode =
         model_prefers_gpu_ && !codec_prefers_gpu_;
@@ -1009,9 +1114,14 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         };
 
         const auto gen_t0 = std::chrono::steady_clock::now();
-        res = generate(model(), tokenizer().config(), prompt, gen_params);
+        res = generate(model(), tokenizer().config(), prompt, gen_params,
+                       prefill_hit ? &cached_state : &prefill_state);
         const auto gen_t1 = std::chrono::steady_clock::now();
         gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
+
+        if (kv_save_thread.joinable()) {
+            kv_save_thread.join();
+        }
 
         {
             std::lock_guard<std::mutex> lock(decode_mtx);
@@ -1038,7 +1148,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
                     if (!params.more_segments_pending) {
                         safe_print_ln("[Pipeline] Freeing Slow-AR from VRAM (request complete)...");
                         model().free_gpu_weights();
-                        model().free_compute_buffers();
+                        if (!keep_kv_on_gpu) model().free_compute_buffers();
                         safe_print_ln("[VRAM Diag] Post-SlowAR free: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
                     }
                 } else {
@@ -1071,9 +1181,14 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
 
     } else {
         const auto gen_t0 = std::chrono::steady_clock::now();
-        res = generate(model(), tokenizer().config(), prompt, gen_params);
+        res = generate(model(), tokenizer().config(), prompt, gen_params,
+                       prefill_hit ? &cached_state : &prefill_state);
         const auto gen_t1 = std::chrono::steady_clock::now();
         gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
+
+        if (kv_save_thread.joinable()) {
+            kv_save_thread.join();
+        }
 
         if (res.n_frames == 0) {
             safe_print_error_ln("Pipeline error: generation produced no frames.");
@@ -1117,7 +1232,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
 
                     if (!params.more_segments_pending) {
                         model().free_gpu_weights();
-                        model().free_compute_buffers();
+                        if (!keep_kv_on_gpu) model().free_compute_buffers();
                     }
                 }
             } else {
@@ -1133,7 +1248,13 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         }
     }
 
-    model().clear_kv_cache();
+    if (!params.more_segments_pending) {
+        if (!kv_reuse) {
+            model().clear_kv_cache();
+        } else if (!keep_kv_on_gpu) {
+            model().set_n_past(0);
+        }
+    }
 
     const auto synth_t1 = std::chrono::steady_clock::now();
 
@@ -1152,6 +1273,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         ", audio_s=" + std::to_string(audio_seconds) +
         ", ref_encode=" + std::to_string(ref_encode_ms) +
         " ms, kv_init=" + std::to_string(kv_ms) +
+        " ms, prefill=" + std::to_string(prefill_ms) +
         " ms, generate=" + std::to_string(gen_ms) +
         " ms, decode=" + std::to_string(decode_ms) +
         " ms, decode_wall=" + std::to_string(decode_wall_ms) +
@@ -1159,6 +1281,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         ", decode_stride=" + std::to_string(offline_decode_stride_frames) +
         " frames" +
         (can_overlap_decode ? ", decode_mode=overlapped" : ", decode_mode=sequential") +
+        (prefill_hit ? ", prefill=cached" : ", prefill=computed") +
         (params.more_segments_pending ? ", vram=held" : "") +
         ", total=" + std::to_string(total_ms) +
         " ms, gen_avg=" + std::to_string(gen_ms_per_frame) +

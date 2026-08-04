@@ -110,6 +110,16 @@ public:
 
     void clear_kv_cache();
 
+    void    reset_kv_cache();
+    int32_t kv_max_seq_len() const { return max_seq_len_; }
+    int32_t n_past()           const { return n_past_; }
+    void    set_n_past(int32_t n)    { n_past_ = n; }
+    bool    save_kv_state(std::vector<uint8_t> & k_out, std::vector<uint8_t> & v_out,
+                          int32_t n_positions);
+    bool    restore_kv_state(const std::vector<uint8_t> & k_data,
+                             const std::vector<uint8_t> & v_data,
+                             int32_t n_past);
+
     MappedFile& mapped_file() { return mapped_gguf_; }
 
     bool allocate_and_load_weights();
@@ -186,11 +196,10 @@ private:
     std::vector<ggml_tensor*> original_cpu_weights_;
     bool weights_on_gpu_ = false;
     bool weights_allocated_ = false;
+    bool codebook_embeddings_cpu_ = false;
+    bool fast_decoder_cpu_ = false;
 
     MappedFile mapped_gguf_;
-
-    bool fast_decoder_cpu_ = false;
-    bool codebook_embeddings_cpu_ = false;
 
     struct FastGraphSlot {
         ggml_context   * ctx        = nullptr;
@@ -210,6 +219,7 @@ private:
     size_t               fast_slot_buf_size_ = 0;
 
     std::vector<FastGraphSlot> fast_slots_;
+    
 };
 
 }
