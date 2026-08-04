@@ -43,6 +43,15 @@ public:
 
     bool free_gpu_weights();
 
+    bool free_encoder_weights();
+    bool restore_encoder_weights();
+    bool free_decoder_weights();
+    bool restore_decoder_weights();
+    bool is_encoder_on_gpu() const;
+    bool is_decoder_on_gpu() const;
+    size_t get_encoder_gpu_bytes() const;
+    size_t get_decoder_gpu_bytes() const;
+
     bool is_weights_on_gpu() const;
 
     bool refresh_host_caches_from_mmap();

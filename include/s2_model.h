@@ -97,9 +97,9 @@ public:
     SlowARModel();
     ~SlowARModel();
 
-    bool load(const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1);
+    bool load(const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1, bool fast_decoder_cpu = false, bool codebook_embeddings_cpu = false);
 
-    bool load_shared(gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1);
+    bool load_shared(gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1, bool fast_decoder_cpu = false, bool codebook_embeddings_cpu = false);
 
     ggml_context * weights_ctx() { return weights_.ctx_w; }
     const std::unordered_set<ggml_tensor *> & weight_tensor_set() const { return weight_tensor_set_; }
@@ -125,6 +125,8 @@ public:
     size_t get_gpu_memory_usage_bytes() const;
 
     bool is_weights_on_gpu() const { return weights_on_gpu_; }
+
+    bool prefers_gpu() const { return !original_gpu_weights_.empty(); }
 
 private:
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
@@ -188,6 +190,7 @@ private:
     MappedFile mapped_gguf_;
 
     bool fast_decoder_cpu_ = false;
+    bool codebook_embeddings_cpu_ = false;
 
     struct FastGraphSlot {
         ggml_context   * ctx        = nullptr;
@@ -207,7 +210,6 @@ private:
     size_t               fast_slot_buf_size_ = 0;
 
     std::vector<FastGraphSlot> fast_slots_;
-    
 };
 
 }
