@@ -96,6 +96,8 @@ void print_uso() {
     safe_print("  --hot-swap                  Aggressively evict weights and OS page cache after each server request (~100 MB RAM, ~25 MB VRAM idle)\n");
     safe_print("  --no-kv-reuse               Disable KV cache reuse and prompt prefill caching (old per-request free/realloc behavior)\n");
     safe_print("  --kv-cache-vram             Pin prefill cache in VRAM between requests (default: system RAM, lower VRAM usage)\n");
+    safe_print("  --cache-type-k <type>       K cache type: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1 (default: f16)[WARNING: Can cause infinite generation, use V cache quant first.]\n");
+    safe_print("  --cache-type-v <type>       V cache type: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1 (default: f16)\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
     safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
@@ -207,6 +209,8 @@ int main(int argc, char** argv) {
         else if (arg == "--hot-swap")              { params.enable_hot_swap    = true; }
         else if (arg == "--no-kv-reuse")           { params.enable_kv_reuse    = false; }
         else if (arg == "--kv-cache-vram")         { params.kv_cache_vram      = true; }
+        else if (arg == "--cache-type-k")          { if (i+1 < argc) params.kv_cache_type_k = argv[++i]; }
+        else if (arg == "--cache-type-v")          { if (i+1 < argc) params.kv_cache_type_v = argv[++i]; }
         else if (arg == "--stream-file")           { use_stream_file = true; }
         else if (arg == "--stream-decode-stride") {
             if (i+1 < argc) {
