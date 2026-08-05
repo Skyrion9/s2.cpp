@@ -106,6 +106,11 @@ public:
 
     bool init_kv_cache(int32_t max_seq_len);
 
+    void set_kv_cache_types(ggml_type k_type, ggml_type v_type) {
+        kv_cache_type_k_ = k_type;
+        kv_cache_type_v_ = v_type;
+    }
+
     void reset();
 
     void clear_kv_cache();
@@ -198,6 +203,8 @@ private:
     bool weights_allocated_ = false;
     bool codebook_embeddings_cpu_ = false;
     bool fast_decoder_cpu_ = false;
+    ggml_type kv_cache_type_k_ = GGML_TYPE_F16;
+    ggml_type kv_cache_type_v_ = GGML_TYPE_F16;
 
     MappedFile mapped_gguf_;
 
