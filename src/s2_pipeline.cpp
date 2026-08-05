@@ -135,6 +135,20 @@ static void safe_print_warn_ln(const std::string& msg) {
     fputc('\n', stderr);
 }
 
+static ggml_type parse_kv_cache_type(const std::string & type_str) {
+    if (type_str == "f32")    return GGML_TYPE_F32;
+    if (type_str == "f16")    return GGML_TYPE_F16;
+    if (type_str == "bf16")   return GGML_TYPE_BF16;
+    if (type_str == "q8_0")   return GGML_TYPE_Q8_0;
+    if (type_str == "q4_0")   return GGML_TYPE_Q4_0;
+    if (type_str == "q4_1")   return GGML_TYPE_Q4_1;
+    if (type_str == "q5_0")   return GGML_TYPE_Q5_0;
+    if (type_str == "q5_1")   return GGML_TYPE_Q5_1;
+    if (type_str == "iq4_nl") return GGML_TYPE_IQ4_NL;
+    safe_print_warn_ln("Warning: unknown --cache-type value '" + type_str + "', defaulting to f16.");
+    return GGML_TYPE_F16;
+}
+
 static double get_max_rss_mb() {
 #ifdef __linux__
     struct rusage usage {};
@@ -466,6 +480,10 @@ bool Pipeline::init(const PipelineParams & params) {
     const auto model_weights_t1 = std::chrono::steady_clock::now();
 
     sync_tokenizer_config_from_model(tokenizer(), model());
+
+    model().set_kv_cache_types(
+        parse_kv_cache_type(params.kv_cache_type_k),
+        parse_kv_cache_type(params.kv_cache_type_v));
 
     initialized_ = true;
     

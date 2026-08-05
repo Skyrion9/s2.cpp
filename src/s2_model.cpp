@@ -629,8 +629,8 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     }
 
     // Layout for flash attention
-    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, max_seq_len, n_head_kv, n_layer);
-    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, max_seq_len, n_head_kv, n_layer);
+    memory_k_ = ggml_new_tensor_4d(ctx_kv_, kv_cache_type_k_, head_dim, max_seq_len, n_head_kv, n_layer);
+    memory_v_ = ggml_new_tensor_4d(ctx_kv_, kv_cache_type_v_, head_dim, max_seq_len, n_head_kv, n_layer);
 
     ggml_backend_t kv_backend = (n_gpu_layers_ > 0 && backend_gpu_) ? backend_gpu_ : backend_cpu_;
     kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, kv_backend);
@@ -643,9 +643,11 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     ggml_backend_tensor_memset(memory_v_, 0, 0, ggml_nbytes(memory_v_));
 
     S2_LOG_INFO_STREAM("[Model] KV cache allocated on "
-              << (n_gpu_layers_ > 0 && backend_gpu_ ? ggml_backend_name(backend_gpu_) : "CPU")
-              << ", size: " << (ggml_backend_buffer_get_size(kv_buf_) / 1024.0 / 1024.0)
-              << " MB" << std::endl);
+        << (n_gpu_layers_ > 0 && backend_gpu_ ? ggml_backend_name(backend_gpu_) : "CPU")
+        << ", K=" << ggml_type_name(kv_cache_type_k_)
+        << ", V=" << ggml_type_name(kv_cache_type_v_)
+        << ", size: " << (ggml_backend_buffer_get_size(kv_buf_) / 1024.0 / 1024.0)
+        << " MB" << std::endl);
 
     return true;
 }
@@ -688,25 +690,31 @@ bool SlowARModel::save_kv_state(std::vector<uint8_t> & k_out,
     const int32_t n_layer   = hparams_.block_count;
     const int32_t n_head_kv = hparams_.head_count_kv;
 
-    const size_t pos_bytes = static_cast<size_t>(n_positions) * memory_k_->nb[1];
-    const size_t out_bytes = static_cast<size_t>(n_layer) * n_head_kv * pos_bytes;
+    const size_t k_pos_bytes = static_cast<size_t>(n_positions) * memory_k_->nb[1];
+    const size_t v_pos_bytes = static_cast<size_t>(n_positions) * memory_v_->nb[1];
+    const size_t k_out_bytes = static_cast<size_t>(n_layer) * n_head_kv * k_pos_bytes;
+    const size_t v_out_bytes = static_cast<size_t>(n_layer) * n_head_kv * v_pos_bytes;
 
-    const size_t full_bytes = ggml_nbytes(memory_k_);
-    std::vector<uint8_t> k_full(full_bytes);
-    std::vector<uint8_t> v_full(full_bytes);
-    ggml_backend_tensor_get(memory_k_, k_full.data(), 0, full_bytes);
-    ggml_backend_tensor_get(memory_v_, v_full.data(), 0, full_bytes);
+    const size_t k_full_bytes = ggml_nbytes(memory_k_);
+    const size_t v_full_bytes = ggml_nbytes(memory_v_);
+    std::vector<uint8_t> k_full(k_full_bytes);
+    std::vector<uint8_t> v_full(v_full_bytes);
+    ggml_backend_tensor_get(memory_k_, k_full.data(), 0, k_full_bytes);
+    ggml_backend_tensor_get(memory_v_, v_full.data(), 0, v_full_bytes);
 
-    k_out.resize(out_bytes);
-    v_out.resize(out_bytes);
-    size_t out_offset = 0;
+    k_out.resize(k_out_bytes);
+    v_out.resize(v_out_bytes);
+    size_t k_off = 0, v_off = 0;
     for (int32_t l = 0; l < n_layer; ++l) {
         for (int32_t h = 0; h < n_head_kv; ++h) {
-            const size_t src = static_cast<size_t>(l) * memory_k_->nb[3]
-                             + static_cast<size_t>(h) * memory_k_->nb[2];
-            std::memcpy(k_out.data() + out_offset, k_full.data() + src, pos_bytes);
-            std::memcpy(v_out.data() + out_offset, v_full.data() + src, pos_bytes);
-            out_offset += pos_bytes;
+            const size_t k_src = static_cast<size_t>(l) * memory_k_->nb[3]
+                               + static_cast<size_t>(h) * memory_k_->nb[2];
+            const size_t v_src = static_cast<size_t>(l) * memory_v_->nb[3]
+                               + static_cast<size_t>(h) * memory_v_->nb[2];
+            std::memcpy(k_out.data() + k_off, k_full.data() + k_src, k_pos_bytes);
+            std::memcpy(v_out.data() + v_off, v_full.data() + v_src, v_pos_bytes);
+            k_off += k_pos_bytes;
+            v_off += v_pos_bytes;
         }
     }
     return true;
@@ -719,27 +727,34 @@ bool SlowARModel::restore_kv_state(const std::vector<uint8_t> & k_data,
 
     const int32_t n_layer   = hparams_.block_count;
     const int32_t n_head_kv = hparams_.head_count_kv;
-    const size_t pos_bytes  = static_cast<size_t>(n_past) * memory_k_->nb[1];
-    const size_t expected   = static_cast<size_t>(n_layer) * n_head_kv * pos_bytes;
-    if (k_data.size() != expected || v_data.size() != expected) return false;
 
-    const size_t full_bytes = ggml_nbytes(memory_k_);
-    std::vector<uint8_t> k_full(full_bytes, 0);
-    std::vector<uint8_t> v_full(full_bytes, 0);
+    const size_t k_pos_bytes = static_cast<size_t>(n_past) * memory_k_->nb[1];
+    const size_t v_pos_bytes = static_cast<size_t>(n_past) * memory_v_->nb[1];
+    const size_t k_expected  = static_cast<size_t>(n_layer) * n_head_kv * k_pos_bytes;
+    const size_t v_expected  = static_cast<size_t>(n_layer) * n_head_kv * v_pos_bytes;
+    if (k_data.size() != k_expected || v_data.size() != v_expected) return false;
 
-    size_t in_offset = 0;
+    const size_t k_full_bytes = ggml_nbytes(memory_k_);
+    const size_t v_full_bytes = ggml_nbytes(memory_v_);
+    std::vector<uint8_t> k_full(k_full_bytes, 0);
+    std::vector<uint8_t> v_full(v_full_bytes, 0);
+
+    size_t k_in = 0, v_in = 0;
     for (int32_t l = 0; l < n_layer; ++l) {
         for (int32_t h = 0; h < n_head_kv; ++h) {
-            const size_t dst = static_cast<size_t>(l) * memory_k_->nb[3]
-                             + static_cast<size_t>(h) * memory_k_->nb[2];
-            std::memcpy(k_full.data() + dst, k_data.data() + in_offset, pos_bytes);
-            std::memcpy(v_full.data() + dst, v_data.data() + in_offset, pos_bytes);
-            in_offset += pos_bytes;
+            const size_t k_dst = static_cast<size_t>(l) * memory_k_->nb[3]
+                               + static_cast<size_t>(h) * memory_k_->nb[2];
+            const size_t v_dst = static_cast<size_t>(l) * memory_v_->nb[3]
+                               + static_cast<size_t>(h) * memory_v_->nb[2];
+            std::memcpy(k_full.data() + k_dst, k_data.data() + k_in, k_pos_bytes);
+            std::memcpy(v_full.data() + v_dst, v_data.data() + v_in, v_pos_bytes);
+            k_in += k_pos_bytes;
+            v_in += v_pos_bytes;
         }
     }
 
-    ggml_backend_tensor_set(memory_k_, k_full.data(), 0, full_bytes);
-    ggml_backend_tensor_set(memory_v_, v_full.data(), 0, full_bytes);
+    ggml_backend_tensor_set(memory_k_, k_full.data(), 0, k_full_bytes);
+    ggml_backend_tensor_set(memory_v_, v_full.data(), 0, v_full_bytes);
 
     n_past_ = n_past;
     return true;
